@@ -96,7 +96,7 @@ func (p *Poller) PollOnce(ctx context.Context) error {
 		if issue.ID == "" {
 			continue
 		}
-		if err := p.orchestrator.RequestDispatch(ctx, issue, nil); err != nil {
+		if err := p.orchestrator.RequestDispatchAfterTrackerRecheck(ctx, issue, nil); err != nil {
 			switch {
 			case errors.Is(err, ErrNotDispatched):
 				continue
@@ -123,12 +123,7 @@ func (p *Poller) reconcileTick(ctx context.Context, activeIssues []tracker.Issue
 	if p.stateTracker == nil {
 		return errors.New("orchestrator poller reconciliation requires state tracker")
 	}
-	activeByID := make(map[string]struct{}, len(activeIssues))
-	for _, issue := range activeIssues {
-		if issue.ID != "" {
-			activeByID[issue.ID] = struct{}{}
-		}
-	}
+	activeByID := issueIDSet(activeIssues)
 	inactiveByID := make(map[string]tracker.Issue)
 	var fetchErr error
 	for _, states := range p.reconcileInactiveStateGroups() {
@@ -167,6 +162,16 @@ func nonEmptyStateList(states []string) []string {
 	for _, state := range states {
 		if strings.TrimSpace(state) != "" {
 			out = append(out, state)
+		}
+	}
+	return out
+}
+
+func issueIDSet(issues []tracker.Issue) map[string]struct{} {
+	out := make(map[string]struct{}, len(issues))
+	for _, issue := range issues {
+		if issue.ID != "" {
+			out[issue.ID] = struct{}{}
 		}
 	}
 	return out
@@ -337,6 +342,11 @@ func RunPollLoop(ctx context.Context, poller *Poller, interval time.Duration) er
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
+	intervalTimer := time.NewTimer(interval)
+	if !intervalTimer.Stop() {
+		<-intervalTimer.C
+	}
+	defer intervalTimer.Stop()
 	for {
 		if err := poller.PollOnce(ctx); err != nil {
 			if ctx.Err() != nil {
@@ -344,10 +354,15 @@ func RunPollLoop(ctx context.Context, poller *Poller, interval time.Duration) er
 			}
 			log.Printf("tracker poll error: %v", err)
 		}
+		intervalTimer.Reset(interval)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(interval):
+		case <-poller.orchestrator.retryWakeCh():
+			if !intervalTimer.Stop() {
+				<-intervalTimer.C
+			}
+		case <-intervalTimer.C:
 		}
 	}
 }

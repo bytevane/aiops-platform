@@ -34,7 +34,7 @@ type sequenceScheduler struct {
 	delays []time.Duration
 }
 
-func (s *sequenceScheduler) NextDelay(int) time.Duration {
+func (s *sequenceScheduler) NextDelay(RetryRequest) time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.delays) == 0 {
@@ -72,6 +72,16 @@ func (f *fakeDispatcher) issueAt(i int) tracker.Issue {
 	return f.issues[i]
 }
 
+func (f *fakeDispatcher) attemptValueAt(i int) *int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.attempts[i] == nil {
+		return nil
+	}
+	attempt := *f.attempts[i]
+	return &attempt
+}
+
 // finishAt completes the i-th spawned worker with the given result.
 // Tests use this to drive the worker-exit path through the actor.
 func (f *fakeDispatcher) finishAt(i int, res WorkerResult) {
@@ -103,7 +113,7 @@ func startActor(t *testing.T, deps Deps) (*Orchestrator, context.CancelFunc) {
 // the mechanism that delivers it.
 func TestRequestDispatch_ConcurrentSameIssueProducesOneRunning(t *testing.T) {
 	disp := &fakeDispatcher{}
-	o, cancel := startActor(t, Deps{Dispatcher: disp, Scheduler: FixedDelayScheduler{Delay: time.Minute}})
+	o, cancel := startActor(t, Deps{Dispatcher: disp, Scheduler: RetryScheduler{MaxBackoff: time.Minute}})
 	defer cancel()
 
 	iss := tracker.Issue{ID: "ENG-1", Identifier: "ENG-1", Title: "race"}
@@ -168,7 +178,7 @@ func TestScheduleRetry_TimerFireProducesExactlyOneReDispatch(t *testing.T) {
 	disp := &fakeDispatcher{}
 	o, cancel := startActor(t, Deps{
 		Dispatcher: disp,
-		Scheduler:  FixedDelayScheduler{Delay: 5 * time.Millisecond},
+		Scheduler:  RetryScheduler{MaxBackoff: 5 * time.Millisecond},
 	})
 	defer cancel()
 
@@ -227,6 +237,210 @@ func TestScheduleRetry_TimerFireProducesExactlyOneReDispatch(t *testing.T) {
 	}
 }
 
+func TestContinuationRetryTimerRequiresTrackerRecheckedDispatch(t *testing.T) {
+	disp := &fakeDispatcher{}
+	o, cancel := startActor(t, Deps{
+		Dispatcher: disp,
+		Scheduler:  &sequenceScheduler{delays: []time.Duration{time.Millisecond}},
+	})
+	defer cancel()
+
+	iss := tracker.Issue{ID: "ENG-10", Identifier: "ENG-10", Title: "continuation"}
+	attempt := 2
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), iss, &attempt); err != nil {
+		t.Fatalf("initial tracker-rechecked dispatch: %v", err)
+	}
+	if got := disp.count(); got != 1 {
+		t.Fatalf("initial dispatch count = %d, want 1", got)
+	}
+
+	disp.finishAt(0, WorkerResult{Elapsed: time.Millisecond})
+	time.Sleep(20 * time.Millisecond)
+
+	if got := disp.count(); got != 1 {
+		t.Fatalf("continuation retry timer spawned without tracker recheck: got %d dispatches, want 1", got)
+	}
+	view, err := o.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(view.Retrying) != 1 {
+		t.Fatalf("retrying view = %+v, want continuation retry retained until tracker recheck", view.Retrying)
+	}
+	if view.Retrying[0].Attempt != 1 {
+		t.Fatalf("continuation retry attempt = %d, want 1", view.Retrying[0].Attempt)
+	}
+
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), iss, nil); err != nil {
+		t.Fatalf("tracker-rechecked continuation dispatch: %v", err)
+	}
+	if got := disp.count(); got != 2 {
+		t.Fatalf("dispatch count after tracker recheck = %d, want 2", got)
+	}
+	if got := disp.attemptValueAt(1); got != nil {
+		t.Fatalf("tracker-rechecked continuation dispatch carried retry attempt = %d, want nil", *got)
+	}
+}
+
+func TestFinalize_NormalExitResetsContinuationAttemptToOne(t *testing.T) {
+	disp := &fakeDispatcher{}
+	o, cancel := startActor(t, Deps{
+		Dispatcher: disp,
+		Scheduler:  &sequenceScheduler{delays: []time.Duration{time.Millisecond}},
+	})
+	defer cancel()
+
+	iss := tracker.Issue{ID: "ENG-CONT-RESET", Identifier: "ENG-CONT-RESET", Title: "reset continuation"}
+	attempt := 7
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), iss, &attempt); err != nil {
+		t.Fatalf("initial tracker-rechecked dispatch: %v", err)
+	}
+	waitFor(t, func() bool { return disp.count() == 1 }, time.Second)
+
+	disp.finishAt(0, WorkerResult{Elapsed: time.Millisecond})
+
+	waitFor(t, func() bool {
+		view, err := o.Snapshot(context.Background())
+		return err == nil && len(view.Retrying) == 1
+	}, time.Second)
+	view, err := o.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if got := view.Retrying[0].Attempt; got != 1 {
+		t.Fatalf("continuation retry attempt after clean exit = %d, want 1", got)
+	}
+}
+
+func TestFinalize_FirstFailureAfterCleanContinuationUsesFirstFailureBackoff(t *testing.T) {
+	disp := &fakeDispatcher{}
+	o, cancel := startActor(t, Deps{
+		Dispatcher: disp,
+		Scheduler:  &sequenceScheduler{delays: []time.Duration{time.Millisecond, time.Hour}},
+	})
+	defer cancel()
+
+	iss := tracker.Issue{ID: "ENG-CONT-FAIL", Identifier: "ENG-CONT-FAIL", Title: "fail after continuation"}
+	priorFailureAttempt := 7
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), iss, &priorFailureAttempt); err != nil {
+		t.Fatalf("initial tracker-rechecked dispatch: %v", err)
+	}
+	waitFor(t, func() bool { return disp.count() == 1 }, time.Second)
+
+	disp.finishAt(0, WorkerResult{Elapsed: time.Millisecond})
+	waitFor(t, func() bool {
+		view, err := o.Snapshot(context.Background())
+		return err == nil && len(view.Retrying) == 1
+	}, time.Second)
+
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), iss, nil); err != nil {
+		t.Fatalf("tracker-rechecked continuation dispatch: %v", err)
+	}
+	waitFor(t, func() bool { return disp.count() == 2 }, time.Second)
+	if got := disp.attemptValueAt(1); got != nil {
+		t.Fatalf("clean continuation dispatch carried failure attempt = %d, want nil", *got)
+	}
+
+	disp.finishAt(1, WorkerResult{Err: errors.New("transient"), Elapsed: time.Millisecond})
+	waitFor(t, func() bool {
+		view, err := o.Snapshot(context.Background())
+		return err == nil && len(view.Retrying) == 1 && view.Retrying[0].Error == "transient"
+	}, time.Second)
+	view, err := o.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if got := view.Retrying[0].Attempt; got != 1 {
+		t.Fatalf("failure after clean continuation scheduled retry attempt = %d, want 1", got)
+	}
+}
+
+func TestContinuationRetryRecheckedDispatchWaitsUntilDue(t *testing.T) {
+	disp := &fakeDispatcher{}
+	o, cancel := startActor(t, Deps{
+		Dispatcher: disp,
+		Scheduler:  &sequenceScheduler{delays: []time.Duration{50 * time.Millisecond}},
+	})
+	defer cancel()
+
+	iss := tracker.Issue{ID: "ENG-11", Identifier: "ENG-11", Title: "continuation not due"}
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), iss, nil); err != nil {
+		t.Fatalf("initial tracker-rechecked dispatch: %v", err)
+	}
+	if got := disp.count(); got != 1 {
+		t.Fatalf("initial dispatch count = %d, want 1", got)
+	}
+
+	disp.finishAt(0, WorkerResult{Elapsed: time.Millisecond})
+	waitFor(t, func() bool {
+		view, err := o.Snapshot(context.Background())
+		return err == nil && len(view.Retrying) == 1
+	}, time.Second)
+
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), iss, nil); !errors.Is(err, ErrNotDispatched) {
+		t.Fatalf("early tracker-rechecked dispatch err = %v, want ErrNotDispatched", err)
+	}
+	if got := disp.count(); got != 1 {
+		t.Fatalf("early tracker recheck spawned before continuation due time: got %d dispatches, want 1", got)
+	}
+
+	waitFor(t, func() bool {
+		view, err := o.Snapshot(context.Background())
+		return err == nil && len(view.Retrying) == 1 && !view.Retrying[0].DueAt.After(time.Now())
+	}, time.Second)
+
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), iss, nil); err != nil {
+		t.Fatalf("due tracker-rechecked continuation dispatch: %v", err)
+	}
+	if got := disp.count(); got != 2 {
+		t.Fatalf("dispatch count after due tracker recheck = %d, want 2", got)
+	}
+}
+
+func TestContinuationRetryRecheckedDispatchKeepsRetryWhenCapacityFull(t *testing.T) {
+	disp := &fakeDispatcher{}
+	st := NewOrchestratorState(15000, 1)
+	o := New(st, Deps{
+		Dispatcher: disp,
+		Scheduler:  &sequenceScheduler{delays: []time.Duration{time.Millisecond}},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go o.Run(ctx)
+	if err := o.WaitStarted(context.Background()); err != nil {
+		t.Fatalf("WaitStarted: %v", err)
+	}
+
+	issueA := tracker.Issue{ID: "ENG-CONT-CAP", Identifier: "ENG-CONT-CAP", Title: "continuation waits"}
+	issueB := tracker.Issue{ID: "ENG-RUNNING", Identifier: "ENG-RUNNING", Title: "running"}
+	if err := o.RequestDispatch(context.Background(), issueB, nil); err != nil {
+		t.Fatalf("dispatch B: %v", err)
+	}
+	waitFor(t, func() bool { return disp.count() == 1 }, time.Second)
+
+	if err := o.scheduleContinuationRetry(context.Background(), issueA, issueA.Identifier, 1); err != nil {
+		t.Fatalf("schedule continuation retry: %v", err)
+	}
+	waitFor(t, func() bool {
+		view, err := o.Snapshot(context.Background())
+		return err == nil && len(view.Retrying) == 1 && !view.Retrying[0].DueAt.After(time.Now())
+	}, time.Second)
+
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), issueA, nil); !errors.Is(err, ErrCapacityFull) {
+		t.Fatalf("tracker-rechecked continuation at capacity err = %v, want ErrCapacityFull", err)
+	}
+	view, err := o.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(view.Retrying) != 1 || view.Retrying[0].IssueID != IssueID(issueA.ID) {
+		t.Fatalf("retrying after capacity rejection = %+v, want continuation retry preserved", view.Retrying)
+	}
+	if got := disp.count(); got != 1 {
+		t.Fatalf("dispatch count after capacity rejection = %d, want only running issue B", got)
+	}
+}
+
 // TestRequestDispatch_DedupesAgainstRunning verifies that once a
 // dispatch is accepted and Running, a second RequestDispatch for the
 // same issue is denied — even though the Claimed window between
@@ -236,7 +450,7 @@ func TestScheduleRetry_TimerFireProducesExactlyOneReDispatch(t *testing.T) {
 // silently regress it.
 func TestRequestDispatch_DedupesAgainstRunning(t *testing.T) {
 	disp := &fakeDispatcher{}
-	o, cancel := startActor(t, Deps{Dispatcher: disp, Scheduler: FixedDelayScheduler{Delay: time.Minute}})
+	o, cancel := startActor(t, Deps{Dispatcher: disp, Scheduler: RetryScheduler{MaxBackoff: time.Minute}})
 	defer cancel()
 
 	iss := tracker.Issue{ID: "ENG-2", Identifier: "ENG-2", Title: "dedupe"}
@@ -255,13 +469,13 @@ func TestRequestDispatch_DedupesAgainstRunning(t *testing.T) {
 	}
 }
 
-// TestFinalize_NormalExitMarksCompletedNoRetry covers the §7.3 normal
-// exit branch end-to-end through the actor: dispatch, the dispatcher
-// returns a successful WorkerResult, the finalize op moves the entry
-// into Completed and does not schedule a retry.
-func TestFinalize_NormalExitMarksCompletedNoRetry(t *testing.T) {
+// TestFinalize_NormalExitMarksCompletedAndSchedulesContinuationRetry covers
+// the §7.3 normal exit branch end-to-end through the actor: dispatch, the
+// dispatcher returns a successful WorkerResult, the finalize op records
+// Completed and schedules a short continuation retry.
+func TestFinalize_NormalExitMarksCompletedAndSchedulesContinuationRetry(t *testing.T) {
 	disp := &fakeDispatcher{}
-	o, cancel := startActor(t, Deps{Dispatcher: disp, Scheduler: FixedDelayScheduler{Delay: time.Minute}})
+	o, cancel := startActor(t, Deps{Dispatcher: disp, Scheduler: RetryScheduler{MaxBackoff: time.Minute}})
 	defer cancel()
 
 	iss := tracker.Issue{ID: "ENG-3", Identifier: "ENG-3", Title: "ok"}
@@ -275,7 +489,7 @@ func TestFinalize_NormalExitMarksCompletedNoRetry(t *testing.T) {
 
 	waitFor(t, func() bool {
 		v, _ := o.Snapshot(context.Background())
-		return len(v.Running) == 0 && len(v.Completed) == 1 && len(v.Retrying) == 0
+		return len(v.Running) == 0 && len(v.Completed) == 1 && len(v.Retrying) == 1
 	}, time.Second)
 }
 
@@ -287,7 +501,7 @@ func TestFinalize_AbnormalExitSchedulesRetry(t *testing.T) {
 	disp := &fakeDispatcher{}
 	o, cancel := startActor(t, Deps{
 		Dispatcher: disp,
-		Scheduler:  FixedDelayScheduler{Delay: 250 * time.Millisecond},
+		Scheduler:  RetryScheduler{MaxBackoff: 250 * time.Millisecond},
 	})
 	defer cancel()
 
@@ -335,7 +549,7 @@ func TestFinalize_AbnormalExitHoldsClaimAcrossScheduleRetryGap(t *testing.T) {
 	// we're testing the gap, not the eventual re-dispatch.
 	o, cancel := startActor(t, Deps{
 		Dispatcher: disp,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	defer cancel()
 
@@ -400,7 +614,7 @@ func TestRetryFire_RespectsCapacityBeforeSpawning(t *testing.T) {
 	st := NewOrchestratorState(15000, 1)
 	o := New(st, Deps{
 		Dispatcher: disp,
-		Scheduler:  FixedDelayScheduler{Delay: 20 * time.Millisecond},
+		Scheduler:  RetryScheduler{MaxBackoff: 20 * time.Millisecond},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -495,6 +709,25 @@ func TestRetryFire_CapacityDeferralUsesShortRecheckDelay(t *testing.T) {
 	}
 }
 
+func TestScheduleRetryUsesReloadedSchedulerWithoutRacing(t *testing.T) {
+	disp := &fakeDispatcher{}
+	o, cancel := startActor(t, Deps{
+		Dispatcher: disp,
+		Scheduler:  &sequenceScheduler{delays: []time.Duration{time.Hour}},
+	})
+	defer cancel()
+
+	if err := o.UpdateRetryScheduler(context.Background(), &sequenceScheduler{delays: []time.Duration{time.Millisecond}}); err != nil {
+		t.Fatalf("UpdateRetryScheduler: %v", err)
+	}
+	iss := tracker.Issue{ID: "ENG-SCHED", Identifier: "ENG-SCHED", Title: "scheduler reload"}
+	if err := o.ScheduleRetry(context.Background(), iss, iss.Identifier, 1, "boom"); err != nil {
+		t.Fatalf("ScheduleRetry: %v", err)
+	}
+
+	waitFor(t, func() bool { return disp.count() == 1 }, time.Second)
+}
+
 // TestApply_FollowupRunsOffActorAndCanResubmit pins the design's
 // "apply must not block on the ops channel" invariant: a followup
 // returned by apply runs on a fresh goroutine, so it can submit
@@ -503,7 +736,7 @@ func TestRetryFire_CapacityDeferralUsesShortRecheckDelay(t *testing.T) {
 // would deadlock and time out.
 func TestApply_FollowupRunsOffActorAndCanResubmit(t *testing.T) {
 	disp := &fakeDispatcher{}
-	o, cancel := startActor(t, Deps{Dispatcher: disp, Scheduler: FixedDelayScheduler{Delay: time.Minute}})
+	o, cancel := startActor(t, Deps{Dispatcher: disp, Scheduler: RetryScheduler{MaxBackoff: time.Minute}})
 	defer cancel()
 
 	resubmitted := make(chan struct{})
@@ -538,7 +771,7 @@ func TestApply_FollowupRunsOffActorAndCanResubmit(t *testing.T) {
 func TestRun_ContextCancelStopsActor(t *testing.T) {
 	disp := &fakeDispatcher{}
 	st := NewOrchestratorState(15000, 4)
-	o := New(st, Deps{Dispatcher: disp, Scheduler: FixedDelayScheduler{Delay: time.Minute}})
+	o := New(st, Deps{Dispatcher: disp, Scheduler: RetryScheduler{MaxBackoff: time.Minute}})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -564,7 +797,7 @@ func TestRun_ContextCancelStopsActor(t *testing.T) {
 // followup submitted, so the Running entry is always visible.
 func TestSnapshot_SerializedThroughActor(t *testing.T) {
 	disp := &fakeDispatcher{}
-	o, cancel := startActor(t, Deps{Dispatcher: disp, Scheduler: FixedDelayScheduler{Delay: time.Minute}})
+	o, cancel := startActor(t, Deps{Dispatcher: disp, Scheduler: RetryScheduler{MaxBackoff: time.Minute}})
 	defer cancel()
 
 	for i := 0; i < 10; i++ {
@@ -582,13 +815,20 @@ func TestSnapshot_SerializedThroughActor(t *testing.T) {
 	}
 }
 
-// TestFixedDelayScheduler_NextDelay is a one-line guard so the legacy
-// 60-second behavior the PR 4 cutover preserves cannot drift silently.
-func TestFixedDelayScheduler_NextDelay(t *testing.T) {
-	s := FixedDelayScheduler{Delay: 60 * time.Second}
-	for attempt := 1; attempt <= 5; attempt++ {
-		if got := s.NextDelay(attempt); got != 60*time.Second {
-			t.Errorf("NextDelay(%d) = %v, want 60s", attempt, got)
+func TestRetryScheduler_FailureBackoffDoublesUntilCap(t *testing.T) {
+	s := RetryScheduler{MaxBackoff: 25 * time.Second}
+	tests := []struct {
+		attempt int
+		want    time.Duration
+	}{
+		{attempt: 1, want: 10 * time.Second},
+		{attempt: 2, want: 20 * time.Second},
+		{attempt: 3, want: 25 * time.Second},
+		{attempt: 4, want: 25 * time.Second},
+	}
+	for _, tt := range tests {
+		if got := s.NextDelay(RetryRequest{Attempt: tt.attempt}); got != tt.want {
+			t.Errorf("failure retry delay attempt %d = %v, want %v", tt.attempt, got, tt.want)
 		}
 	}
 }

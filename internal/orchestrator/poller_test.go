@@ -30,12 +30,14 @@ func (f *fakeIssueTracker) ListActiveIssues(_ context.Context) ([]tracker.Issue,
 type recordingDispatcher struct {
 	mu        sync.Mutex
 	issues    []tracker.Issue
+	attempts  []*int
 	releaseCh chan struct{}
 }
 
-func (d *recordingDispatcher) Spawn(_ context.Context, issue tracker.Issue, _ *int) <-chan WorkerResult {
+func (d *recordingDispatcher) Spawn(_ context.Context, issue tracker.Issue, attempt *int) <-chan WorkerResult {
 	d.mu.Lock()
 	d.issues = append(d.issues, issue)
+	d.attempts = append(d.attempts, attempt)
 	releaseCh := d.releaseCh
 	d.mu.Unlock()
 	ch := make(chan WorkerResult, 1)
@@ -280,7 +282,7 @@ func TestPollOnceCancelsRunningIssueWhenTrackerMovesToCancelled(t *testing.T) {
 	dispatcher := &cancellationDispatcher{}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -313,7 +315,7 @@ func TestPollOnceCancelsRunningIssueWhenTrackerMovesToBacklog(t *testing.T) {
 	dispatcher := &cancellationDispatcher{}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -347,7 +349,7 @@ func TestPollOnceTrackerErrorDoesNotCancelRunningIssue(t *testing.T) {
 	dispatcher := &cancellationDispatcher{}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -396,7 +398,7 @@ func TestPollOnceCancelsTerminalIssueBeforeReturningLaterInactiveFetchError(t *t
 	dispatcher := &cancellationDispatcher{}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -429,7 +431,7 @@ func TestPollOnceDoesNotCancelRunningIssueStillInActiveTrackerListing(t *testing
 	dispatcher := &cancellationDispatcher{}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -465,7 +467,7 @@ func TestPollOnceDoesNotCancelRunningIssueMissingFromPartialTrackerListing(t *te
 	dispatcher := &cancellationDispatcher{}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -502,7 +504,7 @@ func TestPollOnceReturnsErrorWhenCanceledWorkerDoesNotExitBeforeTimeout(t *testi
 	dispatcher := &stuckCancellationDispatcher{}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -534,7 +536,7 @@ func TestPollOnceDispatchesActiveCandidatesWhenCanceledWorkerDoesNotExitBeforeTi
 	dispatcher := &stuckCancellationDispatcher{}
 	orch := New(NewOrchestratorState(30000, 2), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -571,7 +573,7 @@ func TestPollOnceDispatchesTrackerCandidatesThroughRuntimeStateWithoutQueue(t *t
 	dispatcher := &recordingDispatcher{releaseCh: releaseCh}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -606,28 +608,105 @@ func TestPollOnceRedispatchesIssueAfterPriorRunCompleted(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	trackerClient := &fakeIssueTracker{issues: []tracker.Issue{{ID: "issue-1", Identifier: "LIN-1", State: "Rework"}}}
 	dispatcher := &recordingDispatcher{}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  &sequenceScheduler{delays: []time.Duration{time.Millisecond}},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
-		t.Fatalf("wait for orchestrator: %v", err)
+		t.Fatalf("WaitStarted: %v", err)
 	}
+	poller := NewPoller(&fakeIssueTracker{issues: []tracker.Issue{{ID: "issue-1", Identifier: "ISSUE-1", Title: "Issue 1"}}}, orch)
 
-	poller := NewPoller(trackerClient, orch)
 	if err := poller.PollOnce(ctx); err != nil {
-		t.Fatalf("poll once: %v", err)
+		t.Fatalf("initial poll once: %v", err)
 	}
 	waitForDispatcherCount(t, dispatcher, 1)
 	waitForCompleted(t, ctx, orch, "issue-1")
 
+	waitForRetryDue(t, ctx, orch, "issue-1")
 	if err := poller.PollOnce(ctx); err != nil {
 		t.Fatalf("rework poll once: %v", err)
 	}
 	waitForDispatcherCount(t, dispatcher, 2)
+	dispatcher.mu.Lock()
+	secondAttempt := dispatcher.attempts[1]
+	dispatcher.mu.Unlock()
+	if secondAttempt != nil {
+		t.Fatalf("continuation dispatch carried retry attempt = %d, want nil", *secondAttempt)
+	}
+}
+
+func TestPollOnceKeepsDueContinuationRetryMissingFromActiveListing(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dispatcher := &recordingDispatcher{}
+	orch := New(NewOrchestratorState(30000, 1), Deps{
+		Dispatcher: dispatcher,
+		Scheduler:  &sequenceScheduler{delays: []time.Duration{time.Millisecond}},
+	})
+	go orch.Run(ctx)
+	if err := orch.WaitStarted(ctx); err != nil {
+		t.Fatalf("WaitStarted: %v", err)
+	}
+	issue := tracker.Issue{ID: "issue-missing", Identifier: "ISSUE-MISSING", Title: "Issue missing from capped active listing"}
+	poller := NewPoller(&fakeIssueTracker{issues: []tracker.Issue{issue}}, orch)
+
+	if err := poller.PollOnce(ctx); err != nil {
+		t.Fatalf("initial poll once: %v", err)
+	}
+	waitForDispatcherCount(t, dispatcher, 1)
+	waitForCompleted(t, ctx, orch, IssueID(issue.ID))
+	waitForRetryDue(t, ctx, orch, IssueID(issue.ID))
+
+	poller.tracker = &fakeIssueTracker{}
+	if err := poller.PollOnce(ctx); err != nil {
+		t.Fatalf("missing poll once: %v", err)
+	}
+	view, err := orch.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(view.Retrying) != 1 || view.Retrying[0].IssueID != IssueID(issue.ID) {
+		t.Fatalf("retrying after issue missing from active listing = %+v, want continuation retained", view.Retrying)
+	}
+	if got := dispatcher.count(); got != 1 {
+		t.Fatalf("missing continuation poll spawned %d workers, want no new dispatch", got-1)
+	}
+}
+
+func TestRunPollLoopWakesWhenContinuationRetryTimerFires(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	dispatcher := &recordingDispatcher{}
+	orch := New(NewOrchestratorState(30000, 1), Deps{
+		Dispatcher: dispatcher,
+		Scheduler:  &sequenceScheduler{delays: []time.Duration{time.Millisecond}},
+	})
+	go orch.Run(ctx)
+	if err := orch.WaitStarted(ctx); err != nil {
+		t.Fatalf("WaitStarted: %v", err)
+	}
+	issue := tracker.Issue{ID: "issue-1", Identifier: "ISSUE-1", Title: "Issue 1"}
+	poller := NewPoller(&fakeIssueTracker{issues: []tracker.Issue{issue}}, orch)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- RunPollLoop(ctx, poller, time.Hour)
+	}()
+	waitForDispatcherCount(t, dispatcher, 2)
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("RunPollLoop error = %v, want context canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("RunPollLoop did not exit after context cancel")
+	}
 }
 
 func TestPollOnceFailsFastAfterBuildTaskFailureWithoutRetryLoop(t *testing.T) {
@@ -638,7 +717,7 @@ func TestPollOnceFailsFastAfterBuildTaskFailureWithoutRetryLoop(t *testing.T) {
 	dispatcher := &erroringTaskDispatcher{}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -668,7 +747,7 @@ func TestPollOnceReleasesNonRetryableFailureAfterTrackerStateChanges(t *testing.
 	dispatcher := &erroringTaskDispatcher{}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -703,7 +782,7 @@ func TestPollOnceDoesNotExceedMaxConcurrentAgents(t *testing.T) {
 	dispatcher := &blockingDispatcher{}
 	orch := New(NewOrchestratorState(30000, 2), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -733,7 +812,7 @@ func TestPollOnceDispatchesOverflowIssueAfterCapacityFrees(t *testing.T) {
 	dispatcher := &recordingDispatcher{releaseCh: firstRunBlocked}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -777,7 +856,7 @@ func TestPollOnceDropsOverflowIssueThatIsNoLongerActive(t *testing.T) {
 	dispatcher := &recordingDispatcher{releaseCh: make(chan struct{})}
 	orch := New(NewOrchestratorState(30000, 1), Deps{
 		Dispatcher: dispatcher,
-		Scheduler:  FixedDelayScheduler{Delay: time.Hour},
+		Scheduler:  RetryScheduler{MaxBackoff: time.Hour},
 	})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
@@ -794,6 +873,7 @@ func TestPollOnceDropsOverflowIssueThatIsNoLongerActive(t *testing.T) {
 	waitForCompleted(t, ctx, orch, "issue-1")
 	dispatcher.releaseCh = nil
 	trackerClient.issues = []tracker.Issue{{ID: "issue-1", Identifier: "LIN-1", State: "AI Ready"}}
+	waitForRetryDue(t, ctx, orch, "issue-1")
 
 	if err := poller.PollOnce(ctx); err != nil {
 		t.Fatalf("second poll once after issue-2 left active states: %v", err)
@@ -877,6 +957,29 @@ func waitForCompleted(t *testing.T, ctx context.Context, orch *Orchestrator, id 
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("issue %s was not marked completed", id)
+}
+
+func waitForRetryDue(t *testing.T, ctx context.Context, orch *Orchestrator, id IssueID) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		view, err := orch.Snapshot(ctx)
+		if err != nil {
+			t.Fatalf("snapshot: %v", err)
+		}
+		for _, retry := range view.Retrying {
+			if retry.IssueID == id && !retry.DueAt.After(time.Now()) {
+				return
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	view, err := orch.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	t.Fatalf("issue %s retry did not become due: retrying=%v", id, view.Retrying)
 }
 
 func waitForNoRunningOrRetrying(t *testing.T, ctx context.Context, orch *Orchestrator, id IssueID) {

@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -135,7 +136,7 @@ func TestRuntimePollerUsesReloadedTrackerStatesFromSameWorkflowPath(t *testing.T
 		{ID: "issue-rework", Identifier: "ISSUE-2", Title: "rework", State: "Rework"},
 	}}
 	dispatcher := &fakeDispatcher{}
-	orch, cancel := startActor(t, Deps{Dispatcher: dispatcher, Scheduler: FixedDelayScheduler{Delay: time.Minute}})
+	orch, cancel := startActor(t, Deps{Dispatcher: dispatcher, Scheduler: RetryScheduler{MaxBackoff: time.Minute}})
 	defer cancel()
 	poller, err := NewRuntimePoller(trackerClient, orch, runtime, worker.Config{}, nil)
 	if err != nil {
@@ -183,7 +184,7 @@ func TestRuntimePollerAppliesReloadedMaxConcurrentAgentsToDispatchCapacity(t *te
 		{ID: "issue-2", Identifier: "ISSUE-2", Title: "two", State: "AI Ready"},
 	}}
 	dispatcher := &blockingDispatcher{}
-	orch := New(NewOrchestratorState(30000, initial.Config.Agent.MaxConcurrentAgents), Deps{Dispatcher: dispatcher, Scheduler: FixedDelayScheduler{Delay: time.Minute}})
+	orch := New(NewOrchestratorState(30000, initial.Config.Agent.MaxConcurrentAgents), Deps{Dispatcher: dispatcher, Scheduler: RetryScheduler{MaxBackoff: time.Minute}})
 	go orch.Run(ctx)
 	if err := orch.WaitStarted(ctx); err != nil {
 		t.Fatalf("wait for orchestrator: %v", err)
@@ -208,6 +209,55 @@ func TestRuntimePollerAppliesReloadedMaxConcurrentAgentsToDispatchCapacity(t *te
 	waitForBlockingDispatcherCount(t, dispatcher, 2)
 }
 
+func TestRuntimePollerAppliesReloadedMaxRetryBackoffToFailureRetries(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	path := writeWorkflowForReloadTest(t, "linear", 30000, "AI Ready", withReloadTestMaxRetryBackoffMs(1000))
+	initial, err := workflow.Load(path)
+	if err != nil {
+		t.Fatalf("load initial workflow: %v", err)
+	}
+	runtime, err := NewWorkflowRuntime(WorkflowRuntimeConfig{Initial: initial, Path: path, Source: workflow.SourceFile})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	trackerClient := &fakeIssueStateTracker{issues: []tracker.Issue{{ID: "issue-1", Identifier: "ISSUE-1", Title: "one", State: "AI Ready"}}}
+	dispatcher := &fakeDispatcher{}
+	orch := New(NewOrchestratorState(30000, 1), Deps{Dispatcher: dispatcher, Scheduler: RetryScheduler{MaxBackoff: time.Second}})
+	go orch.Run(ctx)
+	if err := orch.WaitStarted(ctx); err != nil {
+		t.Fatalf("wait for orchestrator: %v", err)
+	}
+	poller, err := NewRuntimePoller(trackerClient, orch, runtime, worker.Config{}, nil)
+	if err != nil {
+		t.Fatalf("new runtime poller: %v", err)
+	}
+
+	writeWorkflowForReloadTestAt(t, path, "linear", 30000, "AI Ready", withReloadTestMaxRetryBackoffMs(50))
+	if err := runtime.ReloadOnce(ctx); err != nil {
+		t.Fatalf("reload workflow: %v", err)
+	}
+	if err := poller.PollOnce(ctx); err != nil {
+		t.Fatalf("poll after retry backoff reload: %v", err)
+	}
+	waitFor(t, func() bool { return dispatcher.count() == 1 }, time.Second)
+	dispatcher.finishAt(0, WorkerResult{Err: errors.New("boom"), Elapsed: time.Millisecond})
+
+	waitFor(t, func() bool {
+		view, err := orch.Snapshot(ctx)
+		if err != nil {
+			return false
+		}
+		for _, retry := range view.Retrying {
+			if retry.IssueID == "issue-1" && retry.DueAt.Sub(time.Now()) <= 200*time.Millisecond {
+				return true
+			}
+		}
+		return false
+	}, time.Second)
+}
+
 func TestRuntimePollerRebuildsTrackerClientAfterTrackerConfigReload(t *testing.T) {
 	ctx := context.Background()
 	path := writeWorkflowForReloadTest(t, "linear", 30000, "AI Ready")
@@ -225,7 +275,7 @@ func TestRuntimePollerRebuildsTrackerClientAfterTrackerConfigReload(t *testing.T
 	}
 	factoryCalls := 0
 	dispatcher := &fakeDispatcher{}
-	orch, cancel := startActor(t, Deps{Dispatcher: dispatcher, Scheduler: FixedDelayScheduler{Delay: time.Minute}})
+	orch, cancel := startActor(t, Deps{Dispatcher: dispatcher, Scheduler: RetryScheduler{MaxBackoff: time.Minute}})
 	defer cancel()
 	poller, err := NewRuntimePollerWithTrackerFactory(func(cfg workflow.Config) (IssueStateLister, error) {
 		factoryCalls++
@@ -355,6 +405,40 @@ func TestRunPollLoopWithRuntimeUsesReloadedPollingCadence(t *testing.T) {
 	}
 }
 
+func TestRunPollLoopWithRuntimePollerHonorsInjectedSleep(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	path := writeWorkflowForReloadTest(t, "linear", 60000, "AI Ready")
+	initial, err := workflow.Load(path)
+	if err != nil {
+		t.Fatalf("load initial workflow: %v", err)
+	}
+	runtime, err := NewWorkflowRuntime(WorkflowRuntimeConfig{Initial: initial, Path: path, Source: workflow.SourceFile})
+	if err != nil {
+		t.Fatalf("new runtime: %v", err)
+	}
+	disp := &recordingDispatcher{releaseCh: make(chan struct{})}
+	orch, orchCancel := startActor(t, Deps{Dispatcher: disp, Scheduler: RetryScheduler{MaxBackoff: time.Second}})
+	defer orchCancel()
+	poller, err := NewRuntimePoller(&fakeIssueStateTracker{}, orch, runtime, worker.Config{}, nil)
+	if err != nil {
+		t.Fatalf("new runtime poller: %v", err)
+	}
+	sleeper := &recordingPollSleeper{}
+
+	start := time.Now()
+	err = RunPollLoopWithRuntime(ctx, poller, runtime, PollLoopRuntimeOptions{Sleep: sleeper.sleep, StopAfterPolls: 1})
+	if err != nil {
+		t.Fatalf("run poll loop: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("runtime poll loop ignored injected sleep and waited %v", elapsed)
+	}
+	if got, want := sleeper.durations, []time.Duration{60 * time.Second}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("sleep durations = %v, want %v", got, want)
+	}
+}
+
 type countingPollOnce struct {
 	calls      int
 	afterFirst func()
@@ -390,16 +474,16 @@ func (s *reloadLoopTestSleeper) sleep(_ context.Context, _ time.Duration) error 
 	return nil
 }
 
-func writeWorkflowForReloadTest(t *testing.T, trackerKind string, pollIntervalMs int, activeState string) string {
+func writeWorkflowForReloadTest(t *testing.T, trackerKind string, pollIntervalMs int, activeState string, opts ...reloadWorkflowTestOption) string {
 	t.Helper()
 	path := t.TempDir() + "/WORKFLOW.md"
-	writeWorkflowForReloadTestAt(t, path, trackerKind, pollIntervalMs, activeState)
+	writeWorkflowForReloadTestAt(t, path, trackerKind, pollIntervalMs, activeState, opts...)
 	return path
 }
 
 func writeWorkflowForReloadTestAt(t *testing.T, path, trackerKind string, pollIntervalMs int, activeState string, opts ...reloadWorkflowTestOption) {
 	t.Helper()
-	cfg := reloadWorkflowTestConfig{maxConcurrentAgents: 100}
+	cfg := reloadWorkflowTestConfig{maxConcurrentAgents: 100, maxRetryBackoffMs: 300000}
 	for _, opt := range opts {
 		opt(&cfg)
 	}
@@ -416,6 +500,7 @@ func writeWorkflowForReloadTestAt(t *testing.T, path, trackerKind string, pollIn
 		"agent:\n" +
 		"  default: mock\n" +
 		"  max_concurrent_agents: " + itoaForReloadTest(cfg.maxConcurrentAgents) + "\n" +
+		"  max_retry_backoff_ms: " + itoaForReloadTest(cfg.maxRetryBackoffMs) + "\n" +
 		"---\n" +
 		"Prompt body\n"
 	if err := osWriteFileForReloadTest(path, []byte(content)); err != nil {
@@ -425,6 +510,7 @@ func writeWorkflowForReloadTestAt(t *testing.T, path, trackerKind string, pollIn
 
 type reloadWorkflowTestConfig struct {
 	maxConcurrentAgents int
+	maxRetryBackoffMs   int
 }
 
 type reloadWorkflowTestOption func(*reloadWorkflowTestConfig)
@@ -432,6 +518,12 @@ type reloadWorkflowTestOption func(*reloadWorkflowTestConfig)
 func withReloadTestMaxConcurrentAgents(n int) reloadWorkflowTestOption {
 	return func(cfg *reloadWorkflowTestConfig) {
 		cfg.maxConcurrentAgents = n
+	}
+}
+
+func withReloadTestMaxRetryBackoffMs(n int) reloadWorkflowTestOption {
+	return func(cfg *reloadWorkflowTestConfig) {
+		cfg.maxRetryBackoffMs = n
 	}
 }
 
