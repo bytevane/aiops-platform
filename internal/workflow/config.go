@@ -1,19 +1,32 @@
 package workflow
 
-import "time"
+import (
+	"fmt"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
 
 type Config struct {
-	Repo      RepoConfig      `yaml:"repo" json:"repo"`
-	Tracker   TrackerConfig   `yaml:"tracker" json:"tracker"`
-	Workspace WorkspaceConfig `yaml:"workspace" json:"workspace"`
-	Agent     AgentConfig     `yaml:"agent" json:"agent"`
-	Codex     CommandConfig   `yaml:"codex" json:"codex"`
-	Claude    CommandConfig   `yaml:"claude" json:"claude"`
-	Policy    PolicyConfig    `yaml:"policy" json:"policy"`
-	Safety    SafetyConfig    `yaml:"safety" json:"safety"`
-	Sandbox   SandboxConfig   `yaml:"sandbox" json:"sandbox"`
-	Verify    VerifyConfig    `yaml:"verify" json:"verify"`
-	PR        PRConfig        `yaml:"pr" json:"pr"`
+	Repo       RepoConfig      `yaml:"repo" json:"repo"`
+	Tracker    TrackerConfig   `yaml:"tracker" json:"tracker"`
+	Hooks      WorkspaceHooks  `yaml:"hooks" json:"hooks"`
+	Workspace  WorkspaceConfig `yaml:"workspace" json:"workspace"`
+	hookFields HookFieldPresence
+
+	// hooksTimeoutDefaulted is true when Hooks.TimeoutMs came from DefaultConfig
+	// rather than WORKFLOW.md. It lets WorkspaceHooks keep the SPEC default while
+	// still honoring the legacy workspace.hooks.timeout_ms override during the
+	// one-release migration window.
+	hooksTimeoutDefaulted bool
+	Agent                 AgentConfig   `yaml:"agent" json:"agent"`
+	Codex                 CommandConfig `yaml:"codex" json:"codex"`
+	Claude                CommandConfig `yaml:"claude" json:"claude"`
+	Policy                PolicyConfig  `yaml:"policy" json:"policy"`
+	Safety                SafetyConfig  `yaml:"safety" json:"safety"`
+	Sandbox               SandboxConfig `yaml:"sandbox" json:"sandbox"`
+	Verify                VerifyConfig  `yaml:"verify" json:"verify"`
+	PR                    PRConfig      `yaml:"pr" json:"pr"`
 }
 
 type RepoConfig struct {
@@ -52,7 +65,92 @@ type TrackerStatusConfig struct {
 }
 
 type WorkspaceConfig struct {
-	Root string `yaml:"root" json:"root"`
+	Root       string         `yaml:"root" json:"root"`
+	Hooks      WorkspaceHooks `yaml:"hooks" json:"hooks"`
+	hookFields HookFieldPresence
+}
+
+type WorkspaceHooks struct {
+	AfterCreate  WorkspaceHook `yaml:"after_create" json:"after_create"`
+	BeforeRun    WorkspaceHook `yaml:"before_run" json:"before_run"`
+	AfterRun     WorkspaceHook `yaml:"after_run" json:"after_run"`
+	BeforeRemove WorkspaceHook `yaml:"before_remove" json:"before_remove"`
+	TimeoutMs    int           `yaml:"timeout_ms" json:"timeout_ms"`
+}
+
+type HookFieldPresence struct {
+	AfterCreate  bool
+	BeforeRun    bool
+	AfterRun     bool
+	BeforeRemove bool
+	TimeoutMs    bool
+}
+
+type WorkspaceHook struct {
+	Commands []string `yaml:"commands" json:"commands"`
+}
+
+func (h *WorkspaceHook) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		var command string
+		if err := value.Decode(&command); err != nil {
+			return err
+		}
+		if command != "" {
+			h.Commands = []string{command}
+		}
+		return nil
+	case yaml.SequenceNode:
+		var commands []string
+		if err := value.Decode(&commands); err != nil {
+			return err
+		}
+		h.Commands = commands
+		return nil
+	case yaml.MappingNode:
+		type workspaceHook WorkspaceHook
+		var decoded workspaceHook
+		if err := value.Decode(&decoded); err != nil {
+			return err
+		}
+		*h = WorkspaceHook(decoded)
+		return nil
+	default:
+		return fmt.Errorf("workspace hook must be a shell script string, command list, or commands object")
+	}
+}
+
+func (h WorkspaceHook) HasCommands() bool {
+	return len(h.Commands) > 0
+}
+
+func (h WorkspaceHooks) HasCommands() bool {
+	return h.AfterCreate.HasCommands() || h.BeforeRun.HasCommands() || h.AfterRun.HasCommands() || h.BeforeRemove.HasCommands()
+}
+
+func (c Config) WorkspaceHooks() WorkspaceHooks {
+	hooks := c.Hooks
+	legacy := c.Workspace.Hooks
+	if !c.hookFields.AfterCreate && legacy.AfterCreate.HasCommands() {
+		hooks.AfterCreate = legacy.AfterCreate
+	}
+	if !c.hookFields.BeforeRun && legacy.BeforeRun.HasCommands() {
+		hooks.BeforeRun = legacy.BeforeRun
+	}
+	if !c.hookFields.AfterRun && legacy.AfterRun.HasCommands() {
+		hooks.AfterRun = legacy.AfterRun
+	}
+	if !c.hookFields.BeforeRemove && legacy.BeforeRemove.HasCommands() {
+		hooks.BeforeRemove = legacy.BeforeRemove
+	}
+	if legacy.TimeoutMs > 0 && !c.hookFields.TimeoutMs {
+		hooks.TimeoutMs = legacy.TimeoutMs
+	}
+	if hooks.TimeoutMs <= 0 {
+		hooks.TimeoutMs = 60000
+	}
+	return hooks
 }
 
 type AgentConfig struct {
@@ -228,7 +326,9 @@ func DefaultConfig() Config {
 				Rework:      "Rework",
 			},
 		},
-		Workspace: WorkspaceConfig{Root: "~/aiops-workspaces"},
+		Hooks:                 WorkspaceHooks{TimeoutMs: 60000},
+		hooksTimeoutDefaulted: true,
+		Workspace:             WorkspaceConfig{Root: "~/aiops-workspaces"},
 		// Agent.MaxTimeoutRetries is intentionally left nil here so the
 		// "absent" signal survives a YAML unmarshal that overlays this
 		// default. The effective default of 1 retry is supplied by

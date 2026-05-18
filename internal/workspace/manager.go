@@ -3,13 +3,16 @@ package workspace
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode"
@@ -18,6 +21,50 @@ import (
 	"github.com/xrf9268-hue/aiops-platform/internal/task"
 	"github.com/xrf9268-hue/aiops-platform/internal/workflow"
 )
+
+// HookName identifies one of the SPEC-defined workspace lifecycle hooks.
+type HookName string
+
+const (
+	HookAfterCreate  HookName = "after_create"
+	HookBeforeRun    HookName = "before_run"
+	HookAfterRun     HookName = "after_run"
+	HookBeforeRemove HookName = "before_remove"
+)
+
+// HookResult captures one workspace hook command execution for task events and
+// caller-side failure policy decisions.
+type HookResult struct {
+	Name      HookName
+	Command   string
+	ExitCode  int
+	Output    string
+	Truncated bool
+	Duration  time.Duration
+	Err       error
+}
+
+// HookError reports a failed workspace hook while preserving every command
+// result captured before the failure.
+type HookError struct {
+	Name    HookName
+	Results []HookResult
+	Err     error
+}
+
+func (e *HookError) Error() string {
+	if e == nil || e.Err == nil {
+		return "workspace hook failed"
+	}
+	return fmt.Sprintf("workspace hook %s failed: %v", e.Name, e.Err)
+}
+
+func (e *HookError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
 
 // VerifyOutputCap bounds how many bytes of combined stdout+stderr we keep in
 // memory per verify command. Verbose verify steps (e.g. `go test -v ./...`)
@@ -46,11 +93,15 @@ type VerifyResult struct {
 // holding the entire output of a verbose verify command in memory.
 type cappedBuffer struct {
 	Cap     int
+	mu      sync.Mutex
 	buf     bytes.Buffer
 	dropped int64
 }
 
 func (c *cappedBuffer) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	remaining := c.Cap - c.buf.Len()
 	if remaining > 0 {
 		take := len(p)
@@ -69,9 +120,26 @@ func (c *cappedBuffer) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (c *cappedBuffer) String() string  { return c.buf.String() }
-func (c *cappedBuffer) Truncated() bool { return c.dropped > 0 }
-func (c *cappedBuffer) Dropped() int64  { return c.dropped }
+func (c *cappedBuffer) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.buf.String()
+}
+
+func (c *cappedBuffer) Truncated() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.dropped > 0
+}
+
+func (c *cappedBuffer) Dropped() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.dropped
+}
 
 // Compile-time check that cappedBuffer satisfies io.Writer.
 var _ io.Writer = (*cappedBuffer)(nil)
@@ -154,6 +222,97 @@ func (m *Manager) PrepareGitWorkspace(ctx context.Context, t task.Task) (string,
 	// downstream tooling inspects `git remote -v` from within the worktree.
 	_ = run(ctx, workdir, "git", "remote", "set-url", "origin", t.CloneURL)
 	return workdir, createdNow, nil
+}
+
+// RunWorkspaceHook executes the configured shell commands for a lifecycle hook
+// in workdir, in order, using the shared workspace hook timeout.
+func RunWorkspaceHook(ctx context.Context, workdir string, name HookName, hook workflow.WorkspaceHook, timeoutMs int) ([]HookResult, error) {
+	timeoutMs = EffectiveWorkspaceHookTimeoutMs(timeoutMs)
+	results := make([]HookResult, 0, len(hook.Commands))
+	for _, raw := range hook.Commands {
+		command := strings.TrimSpace(raw)
+		if command == "" {
+			continue
+		}
+		res := runWorkspaceHookCommand(ctx, workdir, name, command, timeoutMs)
+		results = append(results, res)
+		if res.Err != nil {
+			return results, &HookError{Name: name, Results: results, Err: res.Err}
+		}
+	}
+	return results, nil
+}
+
+func EffectiveWorkspaceHookTimeoutMs(timeoutMs int) int {
+	if timeoutMs > 0 {
+		return timeoutMs
+	}
+	return workflow.DefaultConfig().Hooks.TimeoutMs
+}
+
+func workspaceHookWaitDelay(timeoutMs int) time.Duration {
+	if timeoutMs <= 0 {
+		return 100 * time.Millisecond
+	}
+	grace := time.Duration(math.Ceil(float64(timeoutMs)/10)) * time.Millisecond
+	if grace < 100*time.Millisecond {
+		return 100 * time.Millisecond
+	}
+	if grace > time.Second {
+		return time.Second
+	}
+	return grace
+}
+
+func runWorkspaceHookCommand(ctx context.Context, workdir string, name HookName, command string, timeoutMs int) HookResult {
+	start := time.Now()
+	runCtx := ctx
+	cancel := func() {}
+	if timeoutMs > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, time.Duration(timeoutMs)*time.Millisecond)
+	}
+	defer cancel()
+	waitDelay := workspaceHookWaitDelay(timeoutMs)
+
+	cmd := exec.CommandContext(runCtx, "sh", "-lc", command)
+	cmd.Dir = workdir
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = waitDelay
+	var out cappedBuffer
+	out.Cap = VerifyOutputCap
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Start(); err != nil {
+		return HookResult{Name: name, Command: command, ExitCode: exitCode(err), Output: out.String(), Truncated: out.Truncated(), Duration: time.Since(start), Err: err}
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Wait()
+	}()
+
+	var err error
+	select {
+	case err = <-done:
+	case <-runCtx.Done():
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		select {
+		case err = <-done:
+		case <-time.After(waitDelay):
+			err = fmt.Errorf("hook wait exceeded cleanup grace after timeout: %w", runCtx.Err())
+		}
+	}
+	res := HookResult{Name: name, Command: command, ExitCode: exitCode(err), Output: out.String(), Truncated: out.Truncated(), Duration: time.Since(start), Err: err}
+	if runCtx.Err() == context.DeadlineExceeded {
+		res.Err = fmt.Errorf("hook timed out after %dms: %w", timeoutMs, runCtx.Err())
+		res.ExitCode = -1
+	}
+	return res
 }
 
 func WritePrompt(workdir string, prompt string) error {
@@ -633,6 +792,17 @@ func remoteBranchExists(ctx context.Context, workdir, branch string) (bool, erro
 		return false, err
 	}
 	return strings.TrimSpace(stdout.String()) != "", nil
+}
+
+func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode()
+	}
+	return -1
 }
 
 func run(ctx context.Context, dir string, name string, args ...string) error {

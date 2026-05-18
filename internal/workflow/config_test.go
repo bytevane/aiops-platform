@@ -122,6 +122,205 @@ func TestDefaultConfigAgentTimeout(t *testing.T) {
 	}
 }
 
+func TestLoadParsesTopLevelWorkspaceHooks(t *testing.T) {
+	body := `---
+repo:
+  owner: o
+  name: r
+  clone_url: git@example.com:o/r.git
+hooks:
+  after_create:
+    commands:
+      - printf after_create
+  before_run:
+    commands:
+      - printf before_run
+  after_run:
+    commands:
+      - printf after_run
+  before_remove:
+    commands:
+      - printf before_remove
+  timeout_ms: 1234
+---
+prompt body
+`
+	wf, err := Load(writeTempWorkflow(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	hooks := wf.Config.Hooks
+	if !reflect.DeepEqual(hooks.AfterCreate.Commands, []string{"printf after_create"}) {
+		t.Fatalf("Hooks.AfterCreate.Commands = %#v", hooks.AfterCreate.Commands)
+	}
+	if !reflect.DeepEqual(hooks.BeforeRun.Commands, []string{"printf before_run"}) {
+		t.Fatalf("Hooks.BeforeRun.Commands = %#v", hooks.BeforeRun.Commands)
+	}
+	if !reflect.DeepEqual(hooks.AfterRun.Commands, []string{"printf after_run"}) {
+		t.Fatalf("Hooks.AfterRun.Commands = %#v", hooks.AfterRun.Commands)
+	}
+	if !reflect.DeepEqual(hooks.BeforeRemove.Commands, []string{"printf before_remove"}) {
+		t.Fatalf("Hooks.BeforeRemove.Commands = %#v", hooks.BeforeRemove.Commands)
+	}
+	if hooks.TimeoutMs != 1234 {
+		t.Fatalf("Hooks.TimeoutMs = %d, want 1234", hooks.TimeoutMs)
+	}
+}
+
+func TestLoadParsesSpecWorkspaceHookScriptStrings(t *testing.T) {
+	body := `---
+repo:
+  owner: o
+  name: r
+  clone_url: git@example.com:o/r.git
+hooks:
+  after_create: |
+    printf after_create
+  before_run: printf before_run
+  after_run: |
+    printf after_run
+  before_remove: printf before_remove
+---
+prompt body
+`
+	wf, err := Load(writeTempWorkflow(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	hooks := wf.Config.Hooks
+	if !reflect.DeepEqual(hooks.AfterCreate.Commands, []string{"printf after_create\n"}) {
+		t.Fatalf("Hooks.AfterCreate.Commands = %#v", hooks.AfterCreate.Commands)
+	}
+	if !reflect.DeepEqual(hooks.BeforeRun.Commands, []string{"printf before_run"}) {
+		t.Fatalf("Hooks.BeforeRun.Commands = %#v", hooks.BeforeRun.Commands)
+	}
+	if !reflect.DeepEqual(hooks.AfterRun.Commands, []string{"printf after_run\n"}) {
+		t.Fatalf("Hooks.AfterRun.Commands = %#v", hooks.AfterRun.Commands)
+	}
+	if !reflect.DeepEqual(hooks.BeforeRemove.Commands, []string{"printf before_remove"}) {
+		t.Fatalf("Hooks.BeforeRemove.Commands = %#v", hooks.BeforeRemove.Commands)
+	}
+}
+
+func TestWorkspaceHooksMergesTopLevelAndLegacyPerHook(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Hooks = WorkspaceHooks{
+		AfterRun: WorkspaceHook{Commands: []string{"printf top-after-run"}},
+	}
+	cfg.Workspace.Hooks = WorkspaceHooks{
+		AfterCreate:  WorkspaceHook{Commands: []string{"printf legacy-after-create"}},
+		BeforeRemove: WorkspaceHook{Commands: []string{"printf legacy-before-remove"}},
+	}
+
+	hooks := cfg.WorkspaceHooks()
+	if !reflect.DeepEqual(hooks.AfterCreate.Commands, []string{"printf legacy-after-create"}) {
+		t.Fatalf("AfterCreate.Commands = %#v", hooks.AfterCreate.Commands)
+	}
+	if !reflect.DeepEqual(hooks.AfterRun.Commands, []string{"printf top-after-run"}) {
+		t.Fatalf("AfterRun.Commands = %#v", hooks.AfterRun.Commands)
+	}
+	if !reflect.DeepEqual(hooks.BeforeRemove.Commands, []string{"printf legacy-before-remove"}) {
+		t.Fatalf("BeforeRemove.Commands = %#v", hooks.BeforeRemove.Commands)
+	}
+}
+
+func TestWorkspaceHooksHonorsLegacyTimeoutOverride(t *testing.T) {
+	body := `---
+repo:
+  owner: o
+  name: r
+  clone_url: git@example.com:o/r.git
+workspace:
+  hooks:
+    timeout_ms: 4321
+---
+prompt body
+`
+	wf, err := Load(writeTempWorkflow(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if got := wf.Config.WorkspaceHooks().TimeoutMs; got != 4321 {
+		t.Fatalf("WorkspaceHooks().TimeoutMs = %d, want legacy timeout override 4321", got)
+	}
+}
+
+func TestWorkspaceHooksPrefersExplicitTopLevelTimeout(t *testing.T) {
+	body := `---
+repo:
+  owner: o
+  name: r
+  clone_url: git@example.com:o/r.git
+hooks:
+  timeout_ms: 1234
+workspace:
+  hooks:
+    timeout_ms: 4321
+---
+prompt body
+`
+	wf, err := Load(writeTempWorkflow(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if got := wf.Config.WorkspaceHooks().TimeoutMs; got != 1234 {
+		t.Fatalf("WorkspaceHooks().TimeoutMs = %d, want explicit top-level timeout 1234", got)
+	}
+}
+
+func TestWorkspaceHooksPreservesExplicitEmptyTopLevelOverride(t *testing.T) {
+	body := `---
+repo:
+  owner: o
+  name: r
+  clone_url: git@example.com:o/r.git
+hooks:
+  before_run: []
+workspace:
+  hooks:
+    before_run:
+      - printf legacy-before-run
+---
+prompt body
+`
+	wf, err := Load(writeTempWorkflow(t, body))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	if got := wf.Config.WorkspaceHooks().BeforeRun.Commands; len(got) != 0 {
+		t.Fatalf("WorkspaceHooks().BeforeRun.Commands = %#v, want explicit empty top-level hook to suppress legacy hook", got)
+	}
+}
+
+func TestDefaultConfigWorkspaceHooksTimeout(t *testing.T) {
+	if got, want := DefaultConfig().Hooks.TimeoutMs, 60000; got != want {
+		t.Fatalf("DefaultConfig().Hooks.TimeoutMs = %d, want SPEC default %d", got, want)
+	}
+}
+
+func TestLoadRejectsNegativeWorkspaceHooksTimeout(t *testing.T) {
+	body := `---
+repo:
+  owner: o
+  name: r
+  clone_url: git@example.com:o/r.git
+hooks:
+  timeout_ms: -1
+---
+prompt body
+`
+	_, err := Load(writeTempWorkflow(t, body))
+	if err == nil {
+		t.Fatal("Load succeeded, want negative hooks.timeout_ms validation error")
+	}
+	if !strings.Contains(err.Error(), "hooks.timeout_ms") {
+		t.Fatalf("Load error = %v, want hooks.timeout_ms", err)
+	}
+}
+
 func TestDefaultConfigSandboxDisabled(t *testing.T) {
 	cfg := DefaultConfig()
 	if cfg.Sandbox.Enabled {
