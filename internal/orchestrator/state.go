@@ -127,6 +127,8 @@ type OrchestratorState struct {
 
 	CodexTotals     CodexTotals
 	CodexRateLimits *RateLimitSnapshot // nil until the runner populates it
+
+	RecentEvents []RuntimeEvent
 }
 
 // FailedEntry suppresses a deterministic non-retryable failure only while the
@@ -364,6 +366,7 @@ type StateView struct {
 
 	Running         []RunningView
 	Retrying        []RetryView
+	Failed          []IssueID
 	Completed       []IssueID
 	CodexTotals     CodexTotals
 	CodexRateLimits *RateLimitSnapshot
@@ -401,6 +404,7 @@ func (s *OrchestratorState) Snapshot() StateView {
 		MaxConcurrentAgents: s.MaxConcurrentAgents,
 		Running:             make([]RunningView, 0, len(s.Running)),
 		Retrying:            make([]RetryView, 0, len(s.RetryAttempts)),
+		Failed:              make([]IssueID, 0, len(s.Failed)),
 		Completed:           make([]IssueID, 0, len(s.Completed)),
 		CodexTotals:         s.CodexTotals,
 		CodexRateLimits:     s.CodexRateLimits,
@@ -432,6 +436,9 @@ func (s *OrchestratorState) Snapshot() StateView {
 			DueAt:      r.DueAt,
 			Error:      r.Error,
 		})
+	}
+	for id := range s.Failed {
+		view.Failed = append(view.Failed, id)
 	}
 	for id := range s.Completed {
 		view.Completed = append(view.Completed, id)
