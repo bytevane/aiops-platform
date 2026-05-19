@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xrf9268-hue/aiops-platform/internal/task"
 	"github.com/xrf9268-hue/aiops-platform/internal/tracker"
 	"github.com/xrf9268-hue/aiops-platform/internal/worker"
 	"github.com/xrf9268-hue/aiops-platform/internal/workflow"
@@ -1023,6 +1024,83 @@ func TestSelectRoutedCandidatesIgnoresServiceWithoutExplicitRouteBeforeProjectDe
 	}
 	if got[0].ServiceName != "api" {
 		t.Fatalf("routed candidate service = %q, want api", got[0].ServiceName)
+	}
+}
+
+func TestWorkerTaskDispatcherThreadsRunAttemptIntoTask(t *testing.T) {
+	attempt := 3
+	dispatcher := WorkerTaskDispatcher{
+		BuildTask: func(issue tracker.Issue) (task.Task, error) {
+			return task.Task{ID: "issue-1", Attempts: 99}, nil
+		},
+		Config:  worker.Config{Workflow: &workflow.Workflow{}},
+		Emitter: nil,
+	}
+
+	tk, recordedTaskID, err := dispatcher.buildTaskWithAttempt(tracker.Issue{ID: "issue-1"}, &attempt)
+	if err != nil {
+		t.Fatalf("buildTaskWithAttempt: %v", err)
+	}
+	if recordedTaskID != "issue-1" {
+		t.Fatalf("recordedTaskID = %q, want issue-1", recordedTaskID)
+	}
+	want := attempt + 1
+	if tk.Attempts != want {
+		t.Fatalf("task attempts = %d, want run attempt %d from retry counter %d", tk.Attempts, want, attempt)
+	}
+}
+
+func TestWorkerTaskDispatcherThreadsFirstRetryAsSecondRunAttempt(t *testing.T) {
+	attempt := 1
+	dispatcher := WorkerTaskDispatcher{
+		BuildTask: func(issue tracker.Issue) (task.Task, error) {
+			return task.Task{ID: "issue-1"}, nil
+		},
+		Config: worker.Config{Workflow: &workflow.Workflow{}},
+	}
+
+	tk, _, err := dispatcher.buildTaskWithAttempt(tracker.Issue{ID: "issue-1"}, &attempt)
+	if err != nil {
+		t.Fatalf("buildTaskWithAttempt: %v", err)
+	}
+	if tk.Attempts != 2 {
+		t.Fatalf("task attempts = %d, want first retry to render as run attempt 2", tk.Attempts)
+	}
+}
+
+func TestWorkerTaskDispatcherLeavesAttemptWhenRetryAttemptNil(t *testing.T) {
+	dispatcher := WorkerTaskDispatcher{
+		BuildTask: func(issue tracker.Issue) (task.Task, error) {
+			return task.Task{ID: "issue-1", Attempts: 0}, nil
+		},
+		Config: worker.Config{Workflow: &workflow.Workflow{}},
+	}
+
+	tk, _, err := dispatcher.buildTaskWithAttempt(tracker.Issue{ID: "issue-1"}, nil)
+	if err != nil {
+		t.Fatalf("buildTaskWithAttempt: %v", err)
+	}
+	if tk.Attempts != 0 {
+		t.Fatalf("task attempts = %d, want original first-run attempts", tk.Attempts)
+	}
+}
+
+func TestWorkerTaskDispatcherCopiesRetryAttemptBeforeRun(t *testing.T) {
+	attempt := 1
+	dispatcher := WorkerTaskDispatcher{
+		BuildTask: func(issue tracker.Issue) (task.Task, error) {
+			return task.Task{ID: "issue-1"}, nil
+		},
+		Config: worker.Config{Workflow: &workflow.Workflow{}},
+	}
+
+	tk, _, err := dispatcher.buildTaskWithAttempt(tracker.Issue{ID: "issue-1"}, &attempt)
+	if err != nil {
+		t.Fatalf("buildTaskWithAttempt: %v", err)
+	}
+	attempt = 99
+	if tk.Attempts != 2 {
+		t.Fatalf("task attempts changed after caller mutation: got %d, want copied run attempt 2", tk.Attempts)
 	}
 }
 
