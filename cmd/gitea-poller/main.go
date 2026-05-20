@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"strings"
 	"time"
@@ -42,6 +44,9 @@ func main() {
 	baseURL := giteaBaseURL(wf.Config.Tracker)
 	client := gitea.NewTrackerClient(wf.Config.Tracker, baseURL, wf.Config.Repo.Owner, wf.Config.Repo.Name)
 	client.Logf = log.Printf
+	if metricsAddr := os.Getenv("GITEA_POLLER_METRICS_ADDR"); metricsAddr != "" {
+		startMetricsServer(metricsAddr, client)
+	}
 	interval := time.Duration(wf.Config.Tracker.PollIntervalMs) * time.Millisecond
 
 	for {
@@ -88,6 +93,37 @@ func sourceEventID(issue tracker.Issue) string {
 		return issue.ID + "|rework|" + tracker.TimeString(issue.UpdatedAt)
 	}
 	return issue.ID
+}
+
+func startMetricsServer(addr string, client *gitea.TrackerClient) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		writeMetrics(w, r, client)
+	})
+	server := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+	}
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Printf("gitea poller metrics listen error on %s: %v", addr, err)
+		return
+	}
+	go func() {
+		log.Printf("gitea poller metrics listening on %s", listener.Addr())
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+			log.Printf("gitea poller metrics server stopped: %v", err)
+		}
+	}()
+}
+
+func writeMetrics(w http.ResponseWriter, _ *http.Request, client *gitea.TrackerClient) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprintf(w, "# HELP aiops_gitea_issue_pagination_cap_hits_total Gitea issue listings capped after %d pages.\n", gitea.ListIssuesMaxPages())
+	fmt.Fprintln(w, "# TYPE aiops_gitea_issue_pagination_cap_hits_total counter")
+	fmt.Fprintf(w, "aiops_gitea_issue_pagination_cap_hits_total %d\n", client.PaginationCapHits())
 }
 
 func giteaBaseURL(cfg workflow.TrackerConfig) string {
