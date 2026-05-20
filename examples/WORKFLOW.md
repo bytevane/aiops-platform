@@ -13,6 +13,10 @@ repo:
 tracker:
   kind: linear
   api_key: $LINEAR_API_KEY
+  # Required for Linear: maps to the Linear project slugId used by SPEC §11.2
+  # project-scoped polling. Example: https://linear.app/acme/project/aiops-platform-abc123
+  # uses project_slug: aiops-platform-abc123
+  project_slug: your-linear-project-slug
   active_states:
     - AI Ready
     - In Progress
