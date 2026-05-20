@@ -244,6 +244,46 @@ func TestLinearGraphQLRejectsMultipleAnonymousOperationsWithoutHTTPRequest(t *te
 	}
 }
 
+func TestCountGraphQLOperationsIgnoresFragmentDefinitions(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		query string
+		want  int
+	}{
+		{
+			name:  "named query with fragment",
+			query: `query Q { ...F } fragment F on T { id }`,
+			want:  1,
+		},
+		{
+			name:  "named mutation with fragment",
+			query: `mutation M { issueUpdate(id: "1", input: {}) { success } } fragment F on T { id title }`,
+			want:  1,
+		},
+		{
+			name:  "anonymous operation with fragment",
+			query: `{ viewer { ...F } } fragment F on T { id }`,
+			want:  1,
+		},
+		{
+			name:  "fragment directive input object",
+			query: `query Q { ...F } fragment F on T @cache(config: { ttl: 60 }) { id }`,
+			want:  1,
+		},
+		{
+			name:  "multiple operations still counted",
+			query: `query A { viewer { id } } query B { issue(id: "1") { id } }`,
+			want:  2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countGraphQLOperations(tc.query); got != tc.want {
+				t.Fatalf("countGraphQLOperations(%q) = %d, want %d", tc.query, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestLinearGraphQLAllowsSingleAnonymousOperation(t *testing.T) {
 	server := &fakeLinearGraphQLServer{}
 	httpServer := httptest.NewServer(server.handler())
@@ -266,6 +306,54 @@ func TestLinearGraphQLAllowsSingleAnonymousOperation(t *testing.T) {
 	_, _, requests := server.recorded()
 	if requests != 1 {
 		t.Fatalf("server received %d requests, want 1", requests)
+	}
+}
+
+func TestLinearGraphQLAllowsSingleOperationWithFragments(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{
+			name:  "named query",
+			query: `query Q { ...F } fragment F on Issue { id }`,
+		},
+		{
+			name:  "named mutation",
+			query: `mutation M { issueUpdate(id: "1", input: {}) { issue { ...F } } } fragment F on Issue { id }`,
+		},
+		{
+			name: "anonymous query",
+			query: `{ viewer { id } }
+fragment F on Issue { id }`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := &fakeLinearGraphQLServer{}
+			httpServer := httptest.NewServer(server.handler())
+			defer httpServer.Close()
+
+			result, err := linearGraphQLProxy{apiKey: "token", baseURL: httpServer.URL, http: httpServer.Client()}.
+				call(context.Background(), ToolCall{Query: tt.query})
+			if err != nil {
+				t.Fatalf("linear_graphql call: %v", err)
+			}
+			var payload struct {
+				Success bool `json:"success"`
+			}
+			if err := json.Unmarshal([]byte(result), &payload); err != nil {
+				t.Fatalf("result is not structured JSON: %v", err)
+			}
+			if !payload.Success {
+				t.Fatalf("success = false, want true; result=%s", result)
+			}
+			_, _, requests := server.recorded()
+			if requests != 1 {
+				t.Fatalf("server received %d requests, want 1", requests)
+			}
+		})
 	}
 }
 
