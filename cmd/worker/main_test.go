@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1109,6 +1110,8 @@ func writeWorkflowForStartupReconcileTest(t *testing.T, extraFrontMatter string)
   name: demo
   clone_url: https://example.invalid/acme/demo.git
   default_branch: main
+tracker:
+  kind: gitea
 ` + "---\nPrompt body\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatalf("write workflow: %v", err)
@@ -1426,11 +1429,26 @@ func TestLoadWorkflowForStartupReconcileClassifiesConfiguredPromptOnlyWorkflow(t
 	if wf.Config.Tracker.Kind != workflow.DefaultConfig().Tracker.Kind {
 		t.Fatalf("tracker kind = %q, want default %q", wf.Config.Tracker.Kind, workflow.DefaultConfig().Tracker.Kind)
 	}
+	// SPEC §6.4 marks tracker.kind REQUIRED; DefaultConfig leaves it
+	// empty so a prompt-only WORKFLOW.md (which cannot declare front
+	// matter) surfaces an empty kind in the startup log. Operators
+	// must add a `tracker.kind:` line for tracker integration to
+	// dispatch. See DEVIATIONS D28 / #244.
+	//
+	// Assert the trailing-newline form so a regression that re-introduces
+	// any silent default (gitea / linear / github / any future kind)
+	// fails this test — `strings.Contains(s, "tracker.kind=")` alone
+	// would still match `"tracker.kind=gitea\n"`. The regex below catches
+	// any non-whitespace character following `tracker.kind=`, so adding a
+	// new supported kind does not silently bypass the guard.
 	gotLog := logs.String()
-	for _, want := range []string{"startup reconciliation: workflow source=prompt_only", "path=" + workflowPath, "tracker.kind=gitea"} {
+	for _, want := range []string{"startup reconciliation: workflow source=prompt_only", "path=" + workflowPath, "tracker.kind=\n"} {
 		if !strings.Contains(gotLog, want) {
 			t.Fatalf("startup reconciliation log = %q, want substring %q", gotLog, want)
 		}
+	}
+	if regexp.MustCompile(`tracker\.kind=\S`).MatchString(gotLog) {
+		t.Fatalf("startup reconciliation log = %q, must not log a non-empty tracker.kind (regression: SPEC §6.4 REQUIRED was bypassed by a silent default)", gotLog)
 	}
 	for _, forbidden := range []string{"workflow source=file", "reconciliation will be skipped"} {
 		if strings.Contains(gotLog, forbidden) {
@@ -1513,11 +1531,24 @@ func TestLoadWorkflowForStartupReconcileDefaultsWhenNoWorkflowExists(t *testing.
 	if wf.Config.Tracker.Kind != workflow.DefaultConfig().Tracker.Kind {
 		t.Fatalf("tracker kind = %q, want default %q", wf.Config.Tracker.Kind, workflow.DefaultConfig().Tracker.Kind)
 	}
+	// SPEC §6.4 marks tracker.kind REQUIRED; DefaultConfig leaves it
+	// empty so a worker that starts without any WORKFLOW.md surfaces
+	// an empty kind in the startup log. See DEVIATIONS D28 / #244.
+	//
+	// Assert the trailing-newline form so a regression that re-introduces
+	// any silent default (gitea / linear / github / any future kind)
+	// fails this test — `strings.Contains(s, "tracker.kind=")` alone
+	// would still match `"tracker.kind=gitea\n"`. The regex below catches
+	// any non-whitespace character following `tracker.kind=`, so adding a
+	// new supported kind does not silently bypass the guard.
 	gotLog := logs.String()
-	for _, want := range []string{"startup reconciliation: workflow source=default", "tracker.kind=gitea"} {
+	for _, want := range []string{"startup reconciliation: workflow source=default", "tracker.kind=\n"} {
 		if !strings.Contains(gotLog, want) {
 			t.Fatalf("startup reconciliation log = %q, want substring %q", gotLog, want)
 		}
+	}
+	if regexp.MustCompile(`tracker\.kind=\S`).MatchString(gotLog) {
+		t.Fatalf("startup reconciliation log = %q, must not log a non-empty tracker.kind (regression: SPEC §6.4 REQUIRED was bypassed by a silent default)", gotLog)
 	}
 	if strings.Contains(gotLog, "reconciliation will be skipped") {
 		t.Fatalf("startup reconciliation log = %q, did not expect skip diagnostic", gotLog)

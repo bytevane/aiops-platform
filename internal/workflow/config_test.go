@@ -32,6 +32,8 @@ server:
   port: 4567
 repo:
   clone_url: git@example.com:owner/repo.git
+tracker:
+  kind: gitea
 ---
 Prompt body
 `)
@@ -55,6 +57,8 @@ func TestLoadDefaultsServerPortWhenServerBlockIsOmitted(t *testing.T) {
 	path := writeTempWorkflow(t, `---
 repo:
   clone_url: git@example.com:owner/repo.git
+tracker:
+  kind: gitea
 ---
 Prompt body
 `)
@@ -74,6 +78,8 @@ server:
   port: `+fmt.Sprint(port)+`
 repo:
   clone_url: git@example.com:owner/repo.git
+tracker:
+  kind: gitea
 ---
 Prompt body
 `)
@@ -96,6 +102,8 @@ repo:
   clone_url: https://github.com/xrf9268-hue/aiops-platform.git
 polling:
   interval_ms: 12345
+tracker:
+  kind: gitea
 ---
 Prompt body
 `)
@@ -118,6 +126,7 @@ repo:
   name: aiops-platform
   clone_url: https://github.com/xrf9268-hue/aiops-platform.git
 tracker:
+  kind: gitea
   poll_interval_ms: 45678
 ---
 Prompt body
@@ -149,6 +158,7 @@ repo:
   name: aiops-platform
   clone_url: https://github.com/xrf9268-hue/aiops-platform.git
 tracker:
+  kind: gitea
   poll_interval_ms: 45678
 polling:
   interval_ms: 12345
@@ -181,6 +191,8 @@ repo:
   owner: xrf9268-hue
   name: aiops-platform
   clone_url: https://github.com/xrf9268-hue/aiops-platform.git
+tracker:
+  kind: gitea
 ---
 Prompt body
 `)
@@ -204,6 +216,8 @@ repo:
   clone_url: https://github.com/xrf9268-hue/aiops-platform.git
 polling:
   interval_ms: 0
+tracker:
+  kind: gitea
 ---
 Prompt body
 `)
@@ -230,6 +244,8 @@ repo:
   clone_url: https://github.com/xrf9268-hue/aiops-platform.git
 workspace:
   root: .aiops-workspaces
+tracker:
+  kind: gitea
 ---
 Prompt body
 `
@@ -263,6 +279,8 @@ repo:
   clone_url: https://github.com/xrf9268-hue/aiops-platform.git
 workspace:
   root: `+root+`
+tracker:
+  kind: gitea
 ---
 Prompt body
 `)
@@ -294,6 +312,8 @@ repo:
   clone_url: https://github.com/xrf9268-hue/aiops-platform.git
 future_extension:
   enabled: true
+tracker:
+  kind: gitea
 ---
 Prompt body
 `)
@@ -339,6 +359,8 @@ repo:
   clone_url: git@example.com:o/r.git
 pr:
   draft: true
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -375,6 +397,8 @@ agent:
   max_concurrent_agents_by_state:
     In Progress: 2
     rework: 1
+tracker:
+  kind: gitea
 ---
 Prompt body
 `)
@@ -406,6 +430,8 @@ agent:
   max_concurrent_agents_by_state:
     In Progress: 2
     in_progress: 5
+tracker:
+  kind: gitea
 ---
 Prompt body
 `)
@@ -436,6 +462,8 @@ agent:
   default: mock
   max_concurrent_agents_by_state:
     "": 1
+tracker:
+  kind: gitea
 ---
 Prompt body
 `,
@@ -452,6 +480,8 @@ agent:
   default: mock
   max_concurrent_agents_by_state:
     rework: 0
+tracker:
+  kind: gitea
 ---
 Prompt body
 `,
@@ -497,6 +527,8 @@ services:
         - backend
       custom_fields:
         Runtime: go
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -695,6 +727,8 @@ services:
       name: api
     tracker:
       project_slug: api-platform
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -721,6 +755,8 @@ services:
       clone_url: git@example.com:acme/api.git
     tracker:
       project_slug: api-platform
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -755,6 +791,8 @@ services:
       clone_url: git@example.com:acme/api-v2.git
     tracker:
       project_slug: api-v2
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -781,6 +819,8 @@ repo:
   clone_url: git@example.com:o/r.git
 pr:
   draft: false
+tracker:
+  kind: gitea
 ---
 body
 `,
@@ -792,6 +832,8 @@ repo:
   owner: o
   name: r
   clone_url: git@example.com:o/r.git
+tracker:
+  kind: gitea
 ---
 body
 `,
@@ -896,6 +938,8 @@ repo:
   clone_url: git@example.com:o/r.git
 agent:
   max_retry_backoff_ms: 45000
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -916,6 +960,8 @@ repo:
   clone_url: git@example.com:o/r.git
 agent:
   max_retry_backoff_ms: 0
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -936,6 +982,8 @@ repo:
   clone_url: git@example.com:o/r.git
 agent:
   max_turns: 0
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -956,6 +1004,8 @@ repo:
   clone_url: git@example.com:o/r.git
 agent:
   max_retry_attempts: 0
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -976,6 +1026,8 @@ repo:
   clone_url: git@example.com:o/r.git
 agent:
   max_retry_attempts: -1
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1008,6 +1060,8 @@ hooks:
     commands:
       - printf before_remove
   timeout_ms: 1234
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1046,6 +1100,8 @@ hooks:
   after_run: |
     printf after_run
   before_remove: printf before_remove
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1099,6 +1155,8 @@ repo:
 workspace:
   hooks:
     timeout_ms: 4321
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1123,6 +1181,8 @@ hooks:
 workspace:
   hooks:
     timeout_ms: 4321
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1148,6 +1208,8 @@ workspace:
   hooks:
     before_run:
       - printf legacy-before-run
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1171,6 +1233,8 @@ workspace:
   hooks:
     env_passthrough:
       - LEGACY_VAR
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1198,6 +1262,8 @@ workspace:
   hooks:
     env_passthrough:
       - LEGACY_VAR
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1224,6 +1290,8 @@ workspace:
   hooks:
     env_passthrough:
       - LEGACY_VAR
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1251,6 +1319,8 @@ repo:
   clone_url: git@example.com:o/r.git
 hooks:
   timeout_ms: -1
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1293,6 +1363,8 @@ sandbox:
     - HOME
   credential_files:
     - ~/.config/aiops/token
+tracker:
+  kind: gitea
 ---
 hello
 `
@@ -1341,6 +1413,8 @@ sandbox:
   network: allowlist
   env_allowlist:
     - PATH
+tracker:
+  kind: gitea
 ---
 hello
 `
@@ -1370,6 +1444,8 @@ sandbox:
   network: open-internet
   env_allowlist:
     - PATH
+tracker:
+  kind: gitea
 ---
 hello
 `
@@ -1401,6 +1477,8 @@ sandbox:
     - 203.0.113.10/32
   env_allowlist:
     - PATH
+tracker:
+  kind: gitea
 ---
 hello
 `
@@ -1432,6 +1510,8 @@ sandbox:
     - 203.0.113.10/32
   env_allowlist:
     - PATH
+tracker:
+  kind: gitea
 ---
 hello
 `
@@ -1464,6 +1544,8 @@ sandbox:
   network_interface: aiops0
   env_allowlist:
     - PATH
+tracker:
+  kind: gitea
 ---
 hello
 `
@@ -1496,6 +1578,8 @@ sandbox:
   network_interface: aiops0
   env_allowlist:
     - PATH
+tracker:
+  kind: gitea
 ---
 hello
 `
@@ -1522,6 +1606,8 @@ repo:
 sandbox:
   enabled: true
   backend: bubblewrap
+tracker:
+  kind: gitea
 ---
 hello
 `
@@ -1548,6 +1634,8 @@ repo:
 sandbox:
   enabled: true
   backend: vmagic
+tracker:
+  kind: gitea
 ---
 hello
 `
@@ -1574,6 +1662,8 @@ repo:
 sandbox:
   enabled: true
   backend: none
+tracker:
+  kind: gitea
 ---
 hello
 `
@@ -1595,7 +1685,7 @@ hello
 func TestLoadOptionalAppliesAgentTimeoutDefaults(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "WORKFLOW.md")
-	body := "---\nrepo:\n  owner: o\n  name: n\n  clone_url: git@example.com:o/n.git\n  default_branch: main\n---\nhello\n"
+	body := "---\nrepo:\n  owner: o\n  name: n\n  clone_url: git@example.com:o/n.git\n  default_branch: main\ntracker:\n  kind: gitea\n---\nhello\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1616,7 +1706,7 @@ func TestLoadOptionalAppliesAgentTimeoutDefaults(t *testing.T) {
 func TestLoadOptionalHonorsExplicitAgentTimeout(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "WORKFLOW.md")
-	body := "---\nrepo:\n  owner: o\n  name: n\n  clone_url: git@example.com:o/n.git\nagent:\n  timeout: 5m\n  max_timeout_retries: 3\n---\nhello\n"
+	body := "---\nrepo:\n  owner: o\n  name: n\n  clone_url: git@example.com:o/n.git\nagent:\n  timeout: 5m\n  max_timeout_retries: 3\ntracker:\n  kind: gitea\n---\nhello\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -1651,6 +1741,8 @@ repo:
 agent:
   default: mock
   fallback: claude
+tracker:
+  kind: gitea
 ---
 prompt body
 `
@@ -1788,6 +1880,8 @@ repo:
   clone_url: git@example.com:o/r.git
 agent:
   default: codexx
+tracker:
+  kind: gitea
 ---
 prompt
 `
@@ -1818,6 +1912,8 @@ repo:
   owner: o
   name: r
   clone_url: git@example.com:o/r.git
+tracker:
+  kind: gitea
 ---
 prompt
 `
@@ -1867,6 +1963,8 @@ repo:
   owner: o
   name: r
   clone_url: $AIOPS_TEST_REPO_URL
+tracker:
+  kind: gitea
 ---
 prompt
 `
@@ -1902,7 +2000,7 @@ func TestLoadOptional_MissingFileSkipsValidation(t *testing.T) {
 func TestLoadOptionalHonorsExplicitZeroMaxTimeoutRetries(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "WORKFLOW.md")
-	body := "---\nrepo:\n  owner: o\n  name: n\n  clone_url: git@example.com:o/n.git\nagent:\n  max_timeout_retries: 0\n---\nhello\n"
+	body := "---\nrepo:\n  owner: o\n  name: n\n  clone_url: git@example.com:o/n.git\nagent:\n  max_timeout_retries: 0\ntracker:\n  kind: gitea\n---\nhello\n"
 	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -2016,6 +2114,7 @@ func TestLoad_VerifyTimeoutAndAllowFailureRoundTrip(t *testing.T) {
 	body := "---\n" +
 		"repo:\n  owner: o\n  name: r\n  clone_url: git@example.com:o/r.git\n" +
 		"verify:\n  timeout: 5m\n  allow_failure: true\n  commands:\n    - go test ./...\n" +
+		"tracker:\n  kind: gitea\n" +
 		"---\nprompt\n"
 	p := filepath.Join(dir, "WORKFLOW.md")
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
@@ -2269,6 +2368,15 @@ func TestDefaultConfig_AlignsToSPEC_6_4(t *testing.T) {
 		t.Errorf("Tracker.TerminalStates = %#v, want SPEC §6.4 default %#v (order matters; mirrors Elixir schema.ex:54)", cfg.Tracker.TerminalStates, wantTerminal)
 	}
 
+	// SPEC §6.4 marks tracker.kind REQUIRED, so DefaultConfig must
+	// not preset a value: a workflow that omits the field has to
+	// fail the loader rather than silently inherit a profile-specific
+	// implementation default. See DEVIATIONS D28 / #244 for the
+	// retired `gitea` preset.
+	if cfg.Tracker.Kind != "" {
+		t.Errorf("Tracker.Kind = %q, want empty (SPEC §6.4 marks the field REQUIRED; the loader rejects an empty kind)", cfg.Tracker.Kind)
+	}
+
 	// Codex sub-defaults retained from the previous pinning so we do
 	// not regress them when extending the SPEC §6.4 coverage above.
 	if cfg.Codex.ThreadSandbox != "workspace-write" {
@@ -2276,6 +2384,34 @@ func TestDefaultConfig_AlignsToSPEC_6_4(t *testing.T) {
 	}
 	if cfg.Codex.TurnTimeoutMs != 3600000 || cfg.Codex.ReadTimeoutMs != 5000 || cfg.Codex.StallTimeoutMs != 300000 {
 		t.Errorf("Codex timeouts = turn %d read %d stall %d, want 3600000/5000/300000", cfg.Codex.TurnTimeoutMs, cfg.Codex.ReadTimeoutMs, cfg.Codex.StallTimeoutMs)
+	}
+}
+
+// TestLoad_RejectsMissingTrackerKind pins SPEC §6.4's REQUIRED semantics
+// for `tracker.kind`. A workflow that declares front matter but omits
+// the field must fail Load with an error that names the field, the file
+// path, and the supported values. Before #244 closed D28 the loader
+// silently substituted DefaultConfig's `gitea`, so the assertion below
+// also guards against a regression that re-introduces the platform
+// default.
+func TestLoad_RejectsMissingTrackerKind(t *testing.T) {
+	t.Parallel()
+	path := writeTempWorkflow(t, `---
+repo:
+  owner: xrf9268-hue
+  name: aiops-platform
+  clone_url: https://example.invalid/repo.git
+---
+prompt`)
+	_, err := Load(path)
+	if err == nil {
+		t.Fatalf("Load: expected error for missing tracker.kind, got nil")
+	}
+	msg := err.Error()
+	for _, want := range []string{"tracker.kind", "required", "SPEC §6.4", path} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("Load error %q: want substring %q", msg, want)
+		}
 	}
 }
 

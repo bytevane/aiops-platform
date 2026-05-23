@@ -304,6 +304,13 @@ func hasExplicitServiceRoute(route ServiceTrackerRouteConfig) bool {
 }
 
 func validateConfig(path string, cfg Config) error {
+	// tracker.kind is REQUIRED per SPEC §6.4. Check this before any
+	// branch that reads cfg.Tracker.Kind so an operator who omits the
+	// field sees the SPEC contract first rather than a follow-on error
+	// like "repo.clone_url is required unless tracker.kind is linear".
+	if strings.TrimSpace(cfg.Tracker.Kind) == "" {
+		return fmt.Errorf("%s: tracker.kind is required per SPEC §6.4 (allowed: gitea, github, linear)", path)
+	}
 	if strings.TrimSpace(cfg.Repo.CloneURL) == "" {
 		if len(cfg.Services) == 0 {
 			return fmt.Errorf("%s: repo.clone_url is required", path)
