@@ -257,6 +257,18 @@ type Orchestrator struct {
 	candidateListerMu sync.Mutex
 	candidateLister   ActiveIssueLister
 
+	// retryTerminalResolver lets the SPEC §16.6 retry-fire path tell a
+	// terminal issue from a merely-absent one when the active-candidate fetch
+	// returns nothing for it. The candidate lister is active-only, so a
+	// terminal issue is indistinguishable from a deleted one there; resolving
+	// the actual state (the way the reconcile pass does) lets the found==nil
+	// branch clean a terminal workspace through the §18.1 seam instead of
+	// leaking it (#341). nil leaves the legacy release-only behavior. Guarded
+	// by the same swap discipline as candidateLister.
+	retryTerminalResolverMu sync.Mutex
+	retryTerminalResolver   IssueStateRefresher
+	retryTerminalStates     map[string]struct{}
+
 	// runCtx is captured by Run so followup goroutines can cancel
 	// their work when the actor stops. Set once at the top of Run
 	// before close(started); reads from outside the actor synchronize
@@ -394,6 +406,32 @@ func (o *Orchestrator) currentCandidateLister() ActiveIssueLister {
 	o.candidateListerMu.Lock()
 	defer o.candidateListerMu.Unlock()
 	return o.candidateLister
+}
+
+// SetRetryTerminalStateResolver installs (or swaps) the reader the §16.6
+// retry-fire found==nil branch uses to tell a terminal issue from a
+// merely-absent one (#341), along with the lowercased terminal-state set used
+// to classify the resolved state. Production wires the same multi-tracker
+// state reader and terminal_states the reconcile pass uses. nil/empty leaves
+// the legacy release-only behavior (no workspace cleanup on retry-fire). Safe
+// to call before or after Run.
+func (o *Orchestrator) SetRetryTerminalStateResolver(refresher IssueStateRefresher, terminalStates []string) {
+	if o == nil {
+		return
+	}
+	o.retryTerminalResolverMu.Lock()
+	o.retryTerminalResolver = refresher
+	o.retryTerminalStates = normalizedStates(terminalStates)
+	o.retryTerminalResolverMu.Unlock()
+}
+
+func (o *Orchestrator) currentRetryTerminalResolver() (IssueStateRefresher, map[string]struct{}) {
+	if o == nil {
+		return nil, nil
+	}
+	o.retryTerminalResolverMu.Lock()
+	defer o.retryTerminalResolverMu.Unlock()
+	return o.retryTerminalResolver, o.retryTerminalStates
 }
 
 func (o *Orchestrator) queuePollWake() bool {
@@ -935,14 +973,29 @@ func (o *Orchestrator) ReconcileInactiveTrackerIssuesAndWait(ctx context.Context
 // The 1-based attempt counter is the attempt number this retry will
 // run as (i.e. the prior run was attempt-1, or 0 for first-run).
 func (o *Orchestrator) ScheduleRetry(ctx context.Context, issue tracker.Issue, identifier string, attempt int, runErr string) error {
-	return o.scheduleRetry(ctx, issue, identifier, RetryRequest{Kind: RetryKindFailure, Attempt: attempt}, attempt, runErr)
+	return o.scheduleFailureRetry(ctx, issue, identifier, attempt, runErr, Workspace{})
 }
 
-func (o *Orchestrator) scheduleContinuationRetry(ctx context.Context, issue tracker.Issue, identifier string, attempt int) error {
-	return o.scheduleRetry(ctx, issue, identifier, RetryRequest{Kind: RetryKindContinuation, Attempt: attempt}, attempt, "")
+// scheduleFailureRetry is the internal failure-retry entry point that also
+// carries the prior run's workspace forward. A failure retry whose issue is
+// later observed terminal (by the reconcile pass or the SPEC §16.6 retry-fire
+// resolution) cleans this directory through the §18.1 seam rather than leaking
+// it until the next startup sweep (#341). The reschedule paths (capacity defer,
+// retry-poll-failed) thread the existing entry's workspace through so it
+// survives across attempts.
+func (o *Orchestrator) scheduleFailureRetry(ctx context.Context, issue tracker.Issue, identifier string, attempt int, runErr string, workspace Workspace) error {
+	return o.scheduleRetry(ctx, issue, identifier, RetryRequest{Kind: RetryKindFailure, Attempt: attempt}, attempt, runErr, workspace)
 }
 
-func (o *Orchestrator) scheduleRetry(ctx context.Context, issue tracker.Issue, identifier string, req RetryRequest, attempt int, runErr string) error {
+// scheduleContinuationRetry queues the short SPEC §16.6 wake after a clean
+// turn. workspace carries the finalized run's directory so a continuation
+// whose issue is later seen terminal can be cleaned through the §18.1 seam
+// (#341); pass the finalized RunningEntry.Workspace.
+func (o *Orchestrator) scheduleContinuationRetry(ctx context.Context, issue tracker.Issue, identifier string, attempt int, workspace Workspace) error {
+	return o.scheduleRetry(ctx, issue, identifier, RetryRequest{Kind: RetryKindContinuation, Attempt: attempt}, attempt, "", workspace)
+}
+
+func (o *Orchestrator) scheduleRetry(ctx context.Context, issue tracker.Issue, identifier string, req RetryRequest, attempt int, runErr string, workspace Workspace) error {
 	op := &scheduleRetryOp{
 		o:          o,
 		issue:      issue,
@@ -951,6 +1004,7 @@ func (o *Orchestrator) scheduleRetry(ctx context.Context, issue tracker.Issue, i
 		runErr:     runErr,
 		kind:       req.Kind,
 		req:        req,
+		workspace:  workspace,
 	}
 	return o.submit(ctx, op)
 }
@@ -1189,13 +1243,16 @@ type reconcileInactiveTrackerIssuesOp struct {
 
 func (r *reconcileInactiveTrackerIssuesOp) apply(st *OrchestratorState) func() {
 	var cancelEntries []*RunningEntry
-	// blockedCleanups collects terminal-state blocked entries whose workspace
-	// must be removed now (no live worker holds them, unlike running entries
-	// which defer cleanup to the finalize path). Both paths go through the
+	// terminalCleanups collects terminal-state entries that hold no live worker
+	// — blocked (input-required, stopped executing) and retry-queued (a clean
+	// SPEC §16.5 self-stop finalized the run before scheduling the continuation
+	// retry) — whose workspace must be removed now rather than deferred to the
+	// finalize path the way running entries are. Every path goes through the
 	// same WorkspaceCleaner so before_remove fires and a reconcile_workspace
-	// event is emitted — mirroring upstream reconcile_blocked_issue_state,
-	// which cleans the workspace only on a terminal transition.
-	var blockedCleanups []ReconciledWorkspace
+	// event is emitted — mirroring upstream reconcile_blocked_issue_state and
+	// handle_retry_issue_lookup, which clean the workspace only on a terminal
+	// transition.
+	var terminalCleanups []ReconciledWorkspace
 	for id, run := range st.Running {
 		issue, ok := r.issuesByID[string(id)]
 		if !ok {
@@ -1217,9 +1274,21 @@ func (r *reconcileInactiveTrackerIssuesOp) apply(st *OrchestratorState) func() {
 		run.ReconcileCleanupWorkspace = isTerminalTrackerState(issue.State, r.terminalStates)
 		cancelEntries = append(cancelEntries, run)
 	}
-	for id := range st.RetryAttempts {
-		if _, ok := r.issuesByID[string(id)]; !ok {
+	for id, retry := range st.RetryAttempts {
+		issue, ok := r.issuesByID[string(id)]
+		if !ok {
 			continue
+		}
+		// Mirror upstream handle_retry_issue_lookup (orchestrator.ex:1082-1100):
+		// a retry whose issue is now terminal cleans its workspace + releases;
+		// a merely-inactive (non-terminal) one releases only, keeping the
+		// directory for possible reuse. The continuation retry carries the
+		// finalized run's workspace (#341); a failure retry without one yields
+		// no path and is released only.
+		if isTerminalTrackerState(issue.State, r.terminalStates) {
+			if w, okw := terminalWorkspaceForCleanup(id, retry.Identifier, retry.Workspace.Path, retry.Workspace.Root, issue.State); okw {
+				terminalCleanups = append(terminalCleanups, w)
+			}
 		}
 		st.ReleaseClaim(id)
 	}
@@ -1230,7 +1299,7 @@ func (r *reconcileInactiveTrackerIssuesOp) apply(st *OrchestratorState) func() {
 		}
 		if isTerminalTrackerState(issue.State, r.terminalStates) {
 			if w, okw := terminalWorkspaceForCleanup(id, blocked.Identifier, blocked.Workspace.Path, blocked.Workspace.Root, issue.State); okw {
-				blockedCleanups = append(blockedCleanups, w)
+				terminalCleanups = append(terminalCleanups, w)
 			}
 		}
 		st.ReleaseClaim(id)
@@ -1250,7 +1319,7 @@ func (o *Orchestrator) reconcileCancelFollowup(cancelEntries []*RunningEntry, bl
 				entry.CancelWorker()
 			}
 		}
-		for _, w := range blockedCleanups {
+		for _, w := range terminalCleanups {
 			o.runReconciledWorkspaceCleanup(w)
 		}
 		if result != nil {
@@ -1451,6 +1520,7 @@ type scheduleRetryOp struct {
 	runErr     string
 	kind       RetryKind
 	req        RetryRequest
+	workspace  Workspace
 }
 
 func (s *scheduleRetryOp) apply(st *OrchestratorState) func() {
@@ -1472,6 +1542,7 @@ func (s *scheduleRetryOp) apply(st *OrchestratorState) func() {
 		DueAt:      time.Now().Add(delay),
 		Error:      s.runErr,
 		Kind:       s.kind,
+		Workspace:  s.workspace,
 	}
 	entry.Timer = time.AfterFunc(delay, func() {
 		defer recoverPanic("orchestrator.retry_timer")
@@ -1566,12 +1637,43 @@ func (r *retryFireOp) apply(st *OrchestratorState) func() {
 				})
 				return
 			}
+			// found==nil means the issue is not in the active candidate set:
+			// terminal, merely-inactive, or deleted. The active-only fetch
+			// cannot tell them apart, so resolve the actual state (the way the
+			// reconcile pass does) to recover upstream handle_retry_issue_lookup's
+			// terminal branch — terminal → clean the workspace + release, every
+			// other absence → release only (#341). Resolver errors / unknown
+			// states leave terminal=false, preserving the release-only default.
+			terminal := false
+			terminalState := ""
+			if found == nil {
+				if resolver, terminalStates := o.currentRetryTerminalResolver(); resolver != nil && len(terminalStates) > 0 {
+					// Give the terminal-state lookup its own timeout budget rather
+					// than the already-consumed fetchCtx: a slow-but-successful
+					// ListActiveIssues near the deadline would otherwise leave this
+					// call to fail immediately with context-deadline-exceeded,
+					// dropping a terminal issue onto the release-only path and
+					// leaking its workspace — the exact leak this resolves (Codex
+					// P2). Derived from runCtx so actor shutdown still cancels it.
+					resolveCtx, resolveCancel := context.WithTimeout(o.runCtx, retryFetchTimeout)
+					statesByID, rerr := resolver.FetchIssueStatesByIDs(resolveCtx, []string{string(id)})
+					resolveCancel()
+					if rerr == nil {
+						if s := strings.TrimSpace(statesByID[string(id)]); s != "" && isTerminalTrackerState(s, terminalStates) {
+							terminal = true
+							terminalState = s
+						}
+					}
+				}
+			}
 			_ = o.submit(o.runCtx, &retryFireAfterFetchOp{
-				o:       o,
-				id:      id,
-				attempt: attempt,
-				kind:    kind,
-				found:   found,
+				o:             o,
+				id:            id,
+				attempt:       attempt,
+				kind:          kind,
+				found:         found,
+				terminal:      terminal,
+				terminalState: terminalState,
 			})
 		}
 	}
@@ -1595,12 +1697,12 @@ func retryFireDispatchTail(st *OrchestratorState, entry *RetryEntry, id IssueID,
 		// reschedule through the configured backoff with attempt+1 and a
 		// typed "no available orchestrator slots" error instead of arming a
 		// short 100ms re-fire timer.
-		return capacityDeferRetry(st, id, issue, identifier, attempt, o)
+		return capacityDeferRetry(st, id, issue, identifier, attempt, entry.Workspace, o)
 	}
 	if st.StateCapacityFull(issue.State) {
 		// Retry timers must also obey per-state capacity gates. Same
 		// upstream-aligned reschedule shape as the global-cap branch.
-		return capacityDeferRetry(st, id, issue, identifier, attempt, o)
+		return capacityDeferRetry(st, id, issue, identifier, attempt, entry.Workspace, o)
 	}
 	// Consume the retry entry but keep Claimed: the re-dispatch
 	// immediately re-adds Running, and dropping Claimed in between
@@ -1622,7 +1724,7 @@ func retryFireDispatchTail(st *OrchestratorState, entry *RetryEntry, id IssueID,
 // 100ms re-fire loop bypassed the backoff formula, left the attempt
 // counter frozen across thousands of re-fires, and produced no runtime
 // event for the cap-pressure case.
-func capacityDeferRetry(st *OrchestratorState, id IssueID, issue tracker.Issue, identifier string, attempt int, o *Orchestrator) func() {
+func capacityDeferRetry(st *OrchestratorState, id IssueID, issue tracker.Issue, identifier string, attempt int, workspace Workspace, o *Orchestrator) func() {
 	if o.runCtx.Err() != nil {
 		// Mirror retryPollFailedOp's shutdown guard (actor.go above):
 		// the followup's ScheduleRetry would fail submit anyway, so
@@ -1639,7 +1741,9 @@ func capacityDeferRetry(st *OrchestratorState, id IssueID, issue tracker.Issue, 
 		Message:    runErr,
 	})
 	return func() {
-		_ = o.ScheduleRetry(o.runCtx, issue, identifier, nextAttempt, runErr)
+		// Carry the workspace across the reschedule so the §18.1 terminal
+		// cleanup gate still has a path on a later attempt (#341).
+		_ = o.scheduleFailureRetry(o.runCtx, issue, identifier, nextAttempt, runErr, workspace)
 	}
 }
 
@@ -1687,6 +1791,9 @@ func (r *retryPollFailedOp) apply(st *OrchestratorState) func() {
 	}
 	issue := entry.Issue
 	identifier := entry.Identifier
+	// Carry the workspace across the reschedule so the §18.1 terminal cleanup
+	// gate still has a path on a later attempt (#341).
+	workspace := entry.Workspace
 	nextAttempt := r.attempt + 1
 	runErr := "retry poll failed"
 	if r.fetchErr != nil {
@@ -1699,7 +1806,7 @@ func (r *retryPollFailedOp) apply(st *OrchestratorState) func() {
 		Message:    runErr,
 	})
 	return func() {
-		_ = o.ScheduleRetry(o.runCtx, issue, identifier, nextAttempt, runErr)
+		_ = o.scheduleFailureRetry(o.runCtx, issue, identifier, nextAttempt, runErr, workspace)
 	}
 }
 
@@ -1708,12 +1815,19 @@ func (r *retryPollFailedOp) apply(st *OrchestratorState) func() {
 // from the active candidate set (step 3 / step 5: release the claim);
 // otherwise refresh entry.Issue with the live tracker state and proceed
 // to capacity check + dispatch.
+//
+// terminal/terminalState are resolved by the followup only when found == nil:
+// they recover upstream handle_retry_issue_lookup's terminal branch that the
+// active-only candidate fetch collapses into plain absence, so a terminal
+// issue's workspace is cleaned through the §18.1 seam rather than leaked (#341).
 type retryFireAfterFetchOp struct {
-	o       *Orchestrator
-	id      IssueID
-	attempt int
-	kind    RetryKind
-	found   *tracker.Issue
+	o             *Orchestrator
+	id            IssueID
+	attempt       int
+	kind          RetryKind
+	found         *tracker.Issue
+	terminal      bool
+	terminalState string
 }
 
 func (r *retryFireAfterFetchOp) apply(st *OrchestratorState) func() {
@@ -1729,6 +1843,27 @@ func (r *retryFireAfterFetchOp) apply(st *OrchestratorState) func() {
 		// set (either absent or moved to a non-active state). Drop the
 		// retry and release the claim.
 		identifier := entry.Identifier
+		if r.terminal {
+			// Upstream handle_retry_issue_lookup's terminal branch
+			// (orchestrator.ex:1082-1090): a retry whose issue went terminal
+			// cleans its workspace + releases. The worker already exited before
+			// the retry was scheduled, so no live worker holds the directory —
+			// route the removal through the same WorkspaceCleaner seam the
+			// running/blocked terminal paths use (#341). The actor-serialized
+			// re-claim guard inside runReconciledWorkspaceCleanup prevents a
+			// re-dispatch from racing the removal onto the same path.
+			if w, okw := terminalWorkspaceForCleanup(r.id, identifier, entry.Workspace.Path, entry.Workspace.Root, r.terminalState); okw {
+				st.ReleaseClaim(r.id)
+				st.RecordEvent(RuntimeEvent{
+					Kind:       RuntimeEventFailed,
+					IssueID:    r.id,
+					Identifier: identifier,
+					Message:    "retry released: issue terminal, removing workspace",
+				})
+				o := r.o
+				return func() { o.runReconciledWorkspaceCleanup(w) }
+			}
+		}
 		st.ReleaseClaim(r.id)
 		st.RecordEvent(RuntimeEvent{
 			Kind:       RuntimeEventFailed,
@@ -1814,6 +1949,13 @@ func (f *finalizeRunOp) apply(st *OrchestratorState) func() {
 		// the tracker state mid-run, and per-state capacity gates must see
 		// the live state, not the dispatch-time snapshot.
 		issue := f.entry.Issue
+		// Carry the finalized run's workspace onto the continuation retry. A
+		// clean exit can be a SPEC §16.5 self-stop (the per-turn refresher saw
+		// the issue leave the active set); if the issue is later observed
+		// terminal while this continuation is queued, the reconcile pass uses
+		// this path to clean the directory through the §18.1 seam instead of
+		// leaking it until the next startup sweep (#341).
+		workspace := f.entry.Workspace
 		st.Claimed[f.id] = struct{}{}
 		st.ClaimedIssues[f.id] = issue
 		close(f.done)
@@ -1825,7 +1967,7 @@ func (f *finalizeRunOp) apply(st *OrchestratorState) func() {
 		o := f.o
 		identifier := f.identifier
 		return func() {
-			_ = o.scheduleContinuationRetry(o.runCtx, issue, identifier, nextAttempt)
+			_ = o.scheduleContinuationRetry(o.runCtx, issue, identifier, nextAttempt, workspace)
 		}
 	}
 	if f.result.NonRetryable {
@@ -1900,13 +2042,16 @@ func (f *finalizeRunOp) apply(st *OrchestratorState) func() {
 	// Use f.entry.Issue, not f.issue: reconciliation may have refreshed
 	// the tracker state mid-run, and the retry must carry the live state.
 	issue := f.entry.Issue
+	// Carry the workspace so a failure retry whose issue later goes terminal
+	// is cleaned through the §18.1 seam instead of leaking (#341).
+	workspace := f.entry.Workspace
 	st.Claimed[f.id] = struct{}{}
 	st.ClaimedIssues[f.id] = issue
 	close(f.done)
 	o := f.o
 	identifier := f.identifier
 	return func() {
-		_ = o.ScheduleRetry(o.runCtx, issue, identifier, nextAttempt, runErr)
+		_ = o.scheduleFailureRetry(o.runCtx, issue, identifier, nextAttempt, runErr, workspace)
 	}
 }
 
