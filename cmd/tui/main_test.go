@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -181,7 +183,7 @@ func TestFetchState_ReturnsErrorOnNon2xx(t *testing.T) {
 	defer srv.Close()
 
 	client := &http.Client{}
-	_, err := fetchState(client, srv.URL)
+	_, err := fetchState(context.Background(), client, srv.URL)
 	if err == nil {
 		t.Fatal("fetchState returned nil error for 503 response, want error")
 	}
@@ -199,7 +201,7 @@ func TestFetchState_ParsesValidResponse(t *testing.T) {
 	defer srv.Close()
 
 	client := &http.Client{}
-	state, err := fetchState(client, srv.URL)
+	state, err := fetchState(context.Background(), client, srv.URL)
 	if err != nil {
 		t.Fatalf("fetchState error = %v", err)
 	}
@@ -219,5 +221,154 @@ func TestFormatResetValue_IntegerGetsSuffix(t *testing.T) {
 	}
 	if got := formatResetValue("already-string"); got != "already-string" {
 		t.Errorf("formatResetValue(string) = %q, want passthrough", got)
+	}
+}
+
+// ── screen lifecycle (alt-screen / cursor / non-TTY degrade) ──────────────────
+
+// On a TTY the per-frame output must stay byte-for-byte identical to upstream:
+// clear sequence + content + newline.
+func TestScreen_Draw_TTYKeepsParityBytes(t *testing.T) {
+	var buf bytes.Buffer
+	scr := newScreen(&buf, true /* isTTY */, false /* raw */)
+	scr.draw("BODY")
+	if got, want := buf.String(), ansiClear+"BODY\n"; got != want {
+		t.Errorf("draw on TTY = %q, want %q", got, want)
+	}
+}
+
+// Non-TTY output must not contain the clear / alt-screen / cursor control bytes
+// (item 5: piped/redirected output should be plain).
+func TestScreen_Draw_NonTTYDropsControlBytes(t *testing.T) {
+	var buf bytes.Buffer
+	scr := newScreen(&buf, false /* isTTY */, false /* raw */)
+	scr.enter()
+	scr.draw("BODY")
+	scr.restore()
+
+	out := buf.String()
+	if out != "BODY\n" {
+		t.Errorf("non-TTY output = %q, want %q (plain, no control bytes)", out, "BODY\n")
+	}
+	if strings.Contains(out, "\033") {
+		t.Errorf("non-TTY output contains an escape byte: %q", out)
+	}
+}
+
+func TestScreen_EnterRestore_LifecycleSequences(t *testing.T) {
+	var buf bytes.Buffer
+	scr := newScreen(&buf, true /* isTTY */, false /* raw */)
+
+	scr.enter()
+	if got, want := buf.String(), ansiAltScreenEnter+ansiHideCursor; got != want {
+		t.Errorf("enter() = %q, want %q", got, want)
+	}
+
+	buf.Reset()
+	scr.restore()
+	if got, want := buf.String(), ansiShowCursor+ansiReset+ansiAltScreenLeave; got != want {
+		t.Errorf("restore() = %q, want %q", got, want)
+	}
+}
+
+// --raw on a TTY is parity mode: no alt-screen / cursor management, and the
+// per-frame body is exactly the upstream clear+content+newline.
+func TestScreen_RawModeIsParity(t *testing.T) {
+	var buf bytes.Buffer
+	scr := newScreen(&buf, true /* isTTY */, true /* raw */)
+
+	scr.enter()
+	scr.restore()
+	if buf.Len() != 0 {
+		t.Errorf("raw mode enter/restore wrote %q, want nothing", buf.String())
+	}
+
+	scr.draw("BODY")
+	if got, want := buf.String(), ansiClear+"BODY\n"; got != want {
+		t.Errorf("raw draw = %q, want %q", got, want)
+	}
+}
+
+// ── signal-driven graceful restore (item 2) ──────────────────────────────────
+
+// run exits and restores the terminal when its context is cancelled — exactly
+// what signal.NotifyContext delivers on SIGINT/SIGTERM.
+func TestRun_RestoresTerminalOnSignal(t *testing.T) {
+	var buf bytes.Buffer
+	scr := newScreen(&buf, true /* isTTY */, false /* raw */)
+
+	fetch := func(ctx context.Context) (*stateResponse, error) {
+		return &stateResponse{MaxConcurrentAgents: 3}, nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		// A long interval keeps the ticker from firing; only the initial
+		// frame is drawn before the context is cancelled.
+		run(ctx, scr, fetch, time.Hour, "http://example")
+		close(done)
+	}()
+
+	// Give the initial frame time to render, then simulate the signal.
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after context cancellation")
+	}
+
+	out := buf.String()
+	if !strings.HasPrefix(out, ansiAltScreenEnter+ansiHideCursor) {
+		t.Errorf("output did not start by entering alt-screen / hiding cursor: %q", out[:min(40, len(out))])
+	}
+	if !strings.HasSuffix(out, ansiShowCursor+ansiReset+ansiAltScreenLeave) {
+		t.Errorf("output did not end by restoring the terminal: tail=%q", out[max(0, len(out)-40):])
+	}
+	if !strings.Contains(out, "AIOPS STATUS") {
+		t.Errorf("output did not contain a rendered frame: %q", out)
+	}
+}
+
+// A signal arriving mid-fetch must abort the fetch and skip the final frame,
+// so the only control bytes after the last frame are the restore sequence.
+func TestRun_CancelDuringFetchAbortsAndRestores(t *testing.T) {
+	var buf bytes.Buffer
+	scr := newScreen(&buf, true /* isTTY */, false /* raw */)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	fetchStarted := make(chan struct{})
+
+	fetch := func(fctx context.Context) (*stateResponse, error) {
+		close(fetchStarted)
+		// Block until the loop's context is cancelled (the fetchCtx derives
+		// from it), mimicking a slow/hung poll interrupted by Ctrl-C.
+		<-fctx.Done()
+		return nil, fctx.Err()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		run(ctx, scr, fetch, time.Hour, "http://example")
+		close(done)
+	}()
+
+	<-fetchStarted
+	cancel() // signal arrives while the very first fetch is in flight
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("run did not return after cancellation during fetch")
+	}
+
+	// No frame should have been drawn (fetch never returned a usable state
+	// before cancellation), but the terminal must still be restored.
+	out := buf.String()
+	want := ansiAltScreenEnter + ansiHideCursor + ansiShowCursor + ansiReset + ansiAltScreenLeave
+	if out != want {
+		t.Errorf("output = %q, want enter+restore with no frame (%q)", out, want)
 	}
 }

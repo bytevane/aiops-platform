@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,10 +12,12 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
 )
@@ -34,6 +37,12 @@ const (
 
 	// Clear screen + cursor home: equivalent to IO.ANSI.home() <> IO.ANSI.clear()
 	ansiClear = "\033[H\033[2J"
+
+	// Terminal lifecycle sequences (not part of the upstream parity frame body).
+	ansiAltScreenEnter = "\033[?1049h"
+	ansiAltScreenLeave = "\033[?1049l"
+	ansiHideCursor     = "\033[?25l"
+	ansiShowCursor     = "\033[?25h"
 )
 
 // Column widths (mirrors Elixir @running_*_width constants)
@@ -150,6 +159,7 @@ func rollingTPS(samples []tokenSample, now time.Time, currentTokens int64) float
 func main() {
 	urlFlag := flag.String("url", "http://127.0.0.1:4000/", "worker HTTP API base URL")
 	intervalFlag := flag.Duration("interval", 5*time.Second, "poll interval")
+	rawFlag := flag.Bool("raw", false, "disable alt-screen/cursor management (upstream parity mode)")
 	flag.Parse()
 
 	baseURL := strings.TrimSuffix(*urlFlag, "/")
@@ -162,17 +172,98 @@ func main() {
 	stateURL := baseURL + "/api/v1/state"
 	client := &http.Client{Timeout: 10 * time.Second}
 
-	var samples []tokenSample
-	var lastTPS float64
-	var lastTPSSec int64
 	interval := *intervalFlag
 	if interval <= 0 {
 		fmt.Fprintln(os.Stderr, "--interval must be a positive duration (e.g. 5s)")
 		os.Exit(1)
 	}
 
-	for {
-		state, fetchErr := fetchState(client, stateURL)
+	scr := newScreen(os.Stdout, isTerminal(os.Stdout), *rawFlag)
+
+	// A single signal subscription drives both shutdown and the exit status.
+	// Using one subscription (rather than signal.NotifyContext plus a second
+	// signal.Notify) avoids a startup race: two independent subscriptions can't
+	// be installed atomically, so a signal landing between them could cancel ctx
+	// without the value reaching the exit-status channel, hanging shutdown.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+
+	// The first signal cancels ctx — breaking the render loop and aborting any
+	// in-flight fetch (the per-fetch context derives from ctx), so Ctrl-C
+	// restores the terminal immediately even mid-poll. The signal value is
+	// handed to exitSig (buffered, before the cancel) so it can be re-raised for
+	// a conventional exit status.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	exitSig := make(chan os.Signal, 1)
+	go func() {
+		// Channel/cancel only — no panic surface, no external I/O.
+		select {
+		case s := <-sigCh:
+			exitSig <- s
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	fetch := func(ctx context.Context) (*stateResponse, error) {
+		return fetchState(ctx, client, stateURL)
+	}
+
+	run(ctx, scr, fetch, interval, baseURL)
+
+	// run has already restored the terminal (its deferred restore). On signal
+	// shutdown exitSig holds the value (sent before the cancel that unblocks
+	// run); re-raise it so we exit with the conventional 128+signum status (130
+	// for SIGINT). The non-blocking read guarantees we never hang here.
+	select {
+	case s := <-exitSig:
+		raiseAfterSignal(s)
+	default:
+	}
+}
+
+// raiseAfterSignal restores the default disposition for sig and re-raises it so
+// the process terminates with the conventional 128+signum status, falling back
+// to an explicit os.Exit if the re-raised signal doesn't terminate us.
+func raiseAfterSignal(sig os.Signal) {
+	signal.Reset(os.Interrupt, syscall.SIGTERM)
+	if p, err := os.FindProcess(os.Getpid()); err == nil {
+		_ = p.Signal(sig)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if sysSig, ok := sig.(syscall.Signal); ok {
+		os.Exit(128 + int(sysSig))
+	}
+	os.Exit(1)
+}
+
+// run drives the poll/render loop until ctx is cancelled (signal or otherwise),
+// restoring terminal state on the way out so an interrupted dashboard never
+// leaves the real terminal in alt-screen / cursor-hidden state.
+func run(ctx context.Context, scr *screen, fetch func(context.Context) (*stateResponse, error), interval time.Duration, baseURL string) {
+	scr.enter()
+	defer scr.restore()
+
+	var samples []tokenSample
+	var lastTPS float64
+	var lastTPSSec int64
+
+	drawOnce := func() {
+		// Bound each fetch to the poll interval so a slow/hung worker can't
+		// outlive its tick and stall the next refresh (#356). A fetch that
+		// cannot finish within the interval is surfaced as an "unavailable"
+		// frame rather than blocking the loop.
+		fetchCtx, cancel := context.WithTimeout(ctx, interval)
+		defer cancel()
+
+		state, fetchErr := fetch(fetchCtx)
+		// If we're shutting down, don't paint a spurious final (error) frame —
+		// just unwind so the deferred restore runs.
+		if ctx.Err() != nil {
+			return
+		}
 		now := time.Now()
 
 		if fetchErr == nil {
@@ -184,9 +275,67 @@ func main() {
 		}
 
 		content := safeRenderFrame(state, fetchErr, now, lastTPS, baseURL, interval)
-		fmt.Fprint(os.Stdout, ansiClear+content+"\n")
+		scr.draw(content)
+	}
 
-		time.Sleep(interval)
+	drawOnce()
+	if ctx.Err() != nil {
+		return
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			drawOnce()
+		}
+	}
+}
+
+// ── Terminal screen lifecycle ──────────────────────────────────────────────────
+
+// screen wraps the output writer with optional alt-screen / cursor management.
+// The per-frame body bytes are identical across modes; only the surrounding
+// terminal control sequences differ, so upstream parity is preserved.
+type screen struct {
+	w io.Writer
+	// isTTY gates the per-frame clear sequence (the ANSI clear is control noise
+	// when stdout is piped or redirected).
+	isTTY bool
+	// lifecycle gates alt-screen + cursor management. Active only on a real TTY
+	// when --raw is not set.
+	lifecycle bool
+}
+
+func newScreen(w io.Writer, isTTY, raw bool) *screen {
+	return &screen{w: w, isTTY: isTTY, lifecycle: isTTY && !raw}
+}
+
+// enter switches to the alternate screen buffer and hides the cursor.
+func (s *screen) enter() {
+	if s.lifecycle {
+		io.WriteString(s.w, ansiAltScreenEnter+ansiHideCursor)
+	}
+}
+
+// restore reverses enter: show cursor, reset attributes, leave alt-screen.
+func (s *screen) restore() {
+	if s.lifecycle {
+		io.WriteString(s.w, ansiShowCursor+ansiReset+ansiAltScreenLeave)
+	}
+}
+
+// draw writes a single rendered frame. On a TTY each frame is preceded by the
+// upstream clear sequence; on a non-TTY the clear is dropped so the output is
+// plain, appendable text.
+func (s *screen) draw(content string) {
+	if s.isTTY {
+		io.WriteString(s.w, ansiClear+content+"\n")
+	} else {
+		io.WriteString(s.w, content+"\n")
 	}
 }
 
@@ -205,8 +354,12 @@ func safeRenderFrame(state *stateResponse, fetchErr error, now time.Time, tps fl
 	return renderFrame(state, fetchErr, now, tps, baseURL, interval)
 }
 
-func fetchState(client *http.Client, url string) (*stateResponse, error) {
-	resp, err := client.Get(url)
+func fetchState(ctx context.Context, client *http.Client, url string) (*stateResponse, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
