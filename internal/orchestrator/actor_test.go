@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xrf9268-hue/aiops-platform/internal/runner"
 	"github.com/xrf9268-hue/aiops-platform/internal/task"
 	"github.com/xrf9268-hue/aiops-platform/internal/tracker"
 	"github.com/xrf9268-hue/aiops-platform/internal/workflow"
@@ -81,6 +82,35 @@ func (s *sequenceScheduler) nextDelayLocked() time.Duration {
 	d := s.delays[0]
 	s.delays = s.delays[1:]
 	return d
+}
+
+type recordingScheduler struct {
+	delay time.Duration
+
+	mu       sync.Mutex
+	requests []RetryRequest
+}
+
+func (s *recordingScheduler) NextDelay(req RetryRequest) time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.requests = append(s.requests, req)
+	if req.DelayOverride > 0 {
+		return req.DelayOverride
+	}
+	if s.delay > 0 {
+		return s.delay
+	}
+	return time.Hour
+}
+
+func (s *recordingScheduler) lastRequest() (RetryRequest, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.requests) == 0 {
+		return RetryRequest{}, false
+	}
+	return s.requests[len(s.requests)-1], true
 }
 
 func (f *fakeDispatcher) Spawn(ctx context.Context, issue tracker.Issue, attempt *int) <-chan WorkerResult {
@@ -1455,6 +1485,116 @@ func TestFinalize_AbnormalExitStopsAfterOptInFailureRetryBudget(t *testing.T) {
 	}
 	if len(v.Failed) != 1 {
 		t.Fatalf("failed entries after exhausted opt-in budget = %d, want 1 (issue pinned until tracker changes)", len(v.Failed))
+	}
+}
+
+func TestFinalize_QuotaBackoffBypassesFailureRetryBudget(t *testing.T) {
+	disp := &fakeDispatcher{}
+	scheduler := &recordingScheduler{delay: time.Hour}
+	cap := 1
+	o, cancel := startActor(t, Deps{
+		Dispatcher:        disp,
+		Scheduler:         scheduler,
+		MaxFailureRetries: &cap,
+	})
+	defer cancel()
+
+	iss := tracker.Issue{ID: "ENG-QUOTA", Identifier: "ENG-QUOTA", Title: "quota"}
+	attempt := 1
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), iss, &attempt); err != nil {
+		t.Fatalf("RequestDispatchAfterTrackerRecheck: %v", err)
+	}
+	waitFor(t, func() bool { return disp.count() == 1 }, time.Second)
+
+	quotaErr := &runner.QuotaBackoffError{
+		Message:    "usage limit exceeded",
+		RetryAfter: 90 * time.Second,
+	}
+	disp.finishAt(0, WorkerResult{Err: quotaErr, Elapsed: 50 * time.Millisecond})
+
+	waitFor(t, func() bool {
+		v, err := o.Snapshot(context.Background())
+		return err == nil && len(v.Retrying) == 1
+	}, time.Second)
+	v, err := o.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(v.Failed) != 0 {
+		t.Fatalf("failed entries after quota backoff = %d, want 0", len(v.Failed))
+	}
+	if v.Retrying[0].Attempt != 1 {
+		t.Fatalf("quota retry attempt = %d, want original attempt 1", v.Retrying[0].Attempt)
+	}
+	if v.Retrying[0].Error != quotaErr.Error() {
+		t.Fatalf("quota retry error = %q, want %q", v.Retrying[0].Error, quotaErr.Error())
+	}
+	if v.Retrying[0].Kind != RetryKindQuotaBackoff {
+		t.Fatalf("quota retry kind = %q, want %q", v.Retrying[0].Kind, RetryKindQuotaBackoff)
+	}
+	req, ok := scheduler.lastRequest()
+	if !ok {
+		t.Fatal("scheduler request missing")
+	}
+	if req.Kind != RetryKindQuotaBackoff {
+		t.Fatalf("retry kind = %q, want %q", req.Kind, RetryKindQuotaBackoff)
+	}
+	if req.Attempt != 1 {
+		t.Fatalf("retry scheduler attempt = %d, want original attempt 1", req.Attempt)
+	}
+	if req.DelayOverride != 90*time.Second {
+		t.Fatalf("retry delay override = %s, want 90s", req.DelayOverride)
+	}
+}
+
+func TestFinalize_QuotaBackoffDoesNotBumpNextFailureRetryAttempt(t *testing.T) {
+	disp := &fakeDispatcher{}
+	cap := 1
+	o, cancel := startActor(t, Deps{
+		Dispatcher:        disp,
+		Scheduler:         &sequenceScheduler{delays: []time.Duration{time.Hour, time.Hour}},
+		MaxFailureRetries: &cap,
+	})
+	defer cancel()
+
+	iss := tracker.Issue{ID: "ENG-QUOTA-FAIL", Identifier: "ENG-QUOTA-FAIL", Title: "quota then fail"}
+	if err := o.RequestDispatchAfterTrackerRecheck(context.Background(), iss, nil); err != nil {
+		t.Fatalf("RequestDispatchAfterTrackerRecheck: %v", err)
+	}
+	waitFor(t, func() bool { return disp.count() == 1 }, time.Second)
+
+	quotaErr := &runner.QuotaBackoffError{Message: "usage limit exceeded", RetryAfter: time.Hour}
+	disp.finishAt(0, WorkerResult{Err: quotaErr, Elapsed: 50 * time.Millisecond})
+	waitFor(t, func() bool {
+		v, err := o.Snapshot(context.Background())
+		return err == nil && len(v.Retrying) == 1 && v.Retrying[0].Kind == RetryKindQuotaBackoff
+	}, time.Second)
+
+	if err := o.submit(context.Background(), &retryFireOp{
+		o:       o,
+		id:      IssueID(iss.ID),
+		issue:   iss,
+		attempt: 0,
+		kind:    RetryKindQuotaBackoff,
+	}); err != nil {
+		t.Fatalf("submit quota retry fire: %v", err)
+	}
+	waitFor(t, func() bool { return disp.count() == 2 }, time.Second)
+
+	disp.finishAt(1, WorkerResult{Err: errors.New("ordinary failure"), Elapsed: 50 * time.Millisecond})
+	waitFor(t, func() bool {
+		v, err := o.Snapshot(context.Background())
+		return err == nil && len(v.Retrying) == 1 && v.Retrying[0].Kind == RetryKindFailure
+	}, time.Second)
+	v, err := o.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(v.Failed) != 0 {
+		t.Fatalf("failed entries after first ordinary failure post-quota = %d, want 0", len(v.Failed))
+	}
+	if got := v.Retrying[0].Attempt; got != 1 {
+		t.Fatalf("ordinary failure retry attempt after quota = %d, want first failure retry attempt 1", got)
 	}
 }
 
@@ -3747,6 +3887,58 @@ func TestRetryFire_FetchTimeoutReschedulesAsRetryPollFailed(t *testing.T) {
 	}
 	if !strings.Contains(got.Error, context.DeadlineExceeded.Error()) {
 		t.Fatalf("rescheduled error = %q, want the deadline-exceeded reason wrapped in", got.Error)
+	}
+}
+
+func TestRetryFire_QuotaBackoffFetchFailureReschedulesWithoutOrphaningClaim(t *testing.T) {
+	disp := &fakeDispatcher{}
+	lister := &fakeCandidateLister{err: errors.New("tracker unavailable")}
+	o, cancel := startActor(t, Deps{
+		Dispatcher:      disp,
+		Scheduler:       &sequenceScheduler{delays: []time.Duration{time.Hour, time.Hour}},
+		CandidateLister: lister,
+	})
+	defer cancel()
+
+	iss := tracker.Issue{ID: "ENG-QUOTA-POLL", Identifier: "ENG-QUOTA-POLL", Title: "quota poll", State: "AI Ready"}
+	if err := o.scheduleQuotaBackoffRetry(context.Background(), iss, iss.Identifier, 0, "quota backoff", 0, Workspace{}); err != nil {
+		t.Fatalf("scheduleQuotaBackoffRetry: %v", err)
+	}
+
+	if err := o.submit(context.Background(), &retryFireOp{
+		o:       o,
+		id:      IssueID(iss.ID),
+		issue:   iss,
+		attempt: 0,
+		kind:    RetryKindQuotaBackoff,
+	}); err != nil {
+		t.Fatalf("submit quota retry fire: %v", err)
+	}
+
+	waitFor(t, func() bool {
+		v, _ := o.Snapshot(context.Background())
+		return len(v.Retrying) == 1 && strings.Contains(v.Retrying[0].Error, "retry poll failed")
+	}, 2*time.Second)
+
+	v, err := o.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if got := disp.count(); got != 0 {
+		t.Fatalf("Dispatcher.Spawn calls = %d, want 0; failed retry poll must not dispatch", got)
+	}
+	if len(v.Retrying) != 1 {
+		t.Fatalf("retrying entries = %d, want 1 rescheduled quota backoff", len(v.Retrying))
+	}
+	got := v.Retrying[0]
+	if got.Kind != RetryKindQuotaBackoff {
+		t.Fatalf("rescheduled kind = %q, want %q", got.Kind, RetryKindQuotaBackoff)
+	}
+	if got.Attempt != 0 {
+		t.Fatalf("rescheduled quota attempt = %d, want unchanged attempt 0", got.Attempt)
+	}
+	if !strings.Contains(got.Error, "tracker unavailable") {
+		t.Fatalf("rescheduled error = %q, want tracker failure reason", got.Error)
 	}
 }
 
