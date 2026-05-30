@@ -109,6 +109,8 @@ file):
 
 ```bash
 sudo install -d -o aiops -g aiops /etc/aiops-platform
+# Pick the example matching your tracker.kind: examples/WORKFLOW.md (linear),
+# examples/gitea-WORKFLOW.md, or examples/github-local-WORKFLOW.md.
 sudo cp examples/WORKFLOW.md /etc/aiops-platform/WORKFLOW.md   # edit tracker.api_key/kind
 sudo cp .env.example /etc/aiops-platform/worker.env           # fill in the token + paths
 sudo chmod 600 /etc/aiops-platform/worker.env
@@ -171,7 +173,7 @@ for the supervised setups below.
 The worker exposes a loopback-only HTTP server on
 `127.0.0.1:${server.port}` (default `4000`): `/livez`, `/readyz`
 (`503` until startup reconciliation finishes), and `/api/v1/state`.
-Override the bind port with `-port` (`-1` disables the server) and the
+Override the bind port with `--port` (`-1` disables the server) and the
 host with `AIOPS_SERVER_HOST`. The dashboard/state API is unauthenticated
 on pure loopback; if you bind anything other than loopback, require a
 token via `AIOPS_STATE_API_TOKEN` — see README "Operator surfaces".
