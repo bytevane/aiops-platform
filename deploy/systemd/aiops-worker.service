@@ -21,6 +21,12 @@ Group=aiops
 # `tracker.api_key: $VAR`, so the referenced $VAR must be present here.
 EnvironmentFile=/etc/aiops-platform/worker.env
 
+# HOME is the state dir, not a path under /home, so ProtectHome=true below
+# does not mask it. The agent's SSH deploy key therefore lives at
+# $HOME/.ssh and stays reachable. See the runbook "SSH deploy key under
+# hardening".
+Environment=HOME=/var/lib/aiops-platform
+
 # Workflow source and mutable state. StateDirectory creates and chowns
 # /var/lib/aiops-platform to the service user on start.
 Environment=AIOPS_WORKFLOW_PATH=/etc/aiops-platform/WORKFLOW.md
@@ -40,6 +46,9 @@ RestartSec=5s
 # reason (e.g. an agent CLI that needs a wider filesystem view).
 NoNewPrivileges=true
 ProtectSystem=strict
+# Masks /home, /root, /run/user only. HOME is set to the StateDirectory
+# path /var/lib/aiops-platform above, so the agent's SSH deploy key under
+# $HOME/.ssh is not hidden.
 ProtectHome=true
 PrivateTmp=true
 PrivateDevices=true

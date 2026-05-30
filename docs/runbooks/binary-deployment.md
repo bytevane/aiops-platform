@@ -5,7 +5,7 @@ container runtime. Docker is **optional** in this project (see
 [`local-dev.md`](local-dev.md) "Prerequisites"); the worker is a
 self-contained Go binary that launches the configured agent as a local
 subprocess. Use this path when you want to run the worker directly under
-an init system (systemd) or a process supervisor instead of Compose.
+a service manager (systemd on Linux, launchd on macOS) instead of Compose.
 
 > This runbook is the operator companion to README's "Quick start:
 > worker-owned tracker polling path" and to [`local-dev.md`](local-dev.md).
@@ -26,6 +26,11 @@ an init system (systemd) or a process supervisor instead of Compose.
 
 ## 1. Host prerequisites
 
+This runbook covers both **Linux** (systemd) and **macOS** (launchd)
+hosts. The binary, build, config, and `--doctor` steps are identical on
+both; only the service-manager integration (§5) and a few default paths
+differ, called out inline.
+
 These are host-level tools (not an image). Install whatever your
 configured `agent.default` and clone URLs actually exercise:
 
@@ -36,6 +41,12 @@ configured `agent.default` and clone URLs actually exercise:
 | `ssh` (`openssh-client`) | When pushing over an SSH clone URL | The agent pushes branches; `worker --doctor` flags a missing `ssh` only when SSH clone URLs are configured. |
 | `rg` (ripgrep) | Recommended | Faster agent code search; doctor warns if absent. |
 | `codex` / `claude` CLI on `PATH` | Only when `agent.default` selects it | `mock` needs no external CLI. Keep first real runs on `mock`. |
+
+Install hints by platform:
+
+- **Debian/Ubuntu:** `sudo apt-get install -y git ca-certificates openssh-client ripgrep`
+- **macOS:** `git` and `ssh` ship with the Xcode Command Line Tools
+  (`xcode-select --install`); add ripgrep with `brew install ripgrep`.
 
 > **Note on `worker --doctor` wording.** Several doctor remediation
 > strings say "… in the worker image" (e.g. a missing `ssh` suggests
@@ -54,8 +65,10 @@ scripts/install.sh                 # builds dist/worker and dist/tui
 sudo scripts/install.sh --prefix /usr/local   # build + install to /usr/local/bin
 ```
 
-The script uses the same canonical flags as CI
-(`-trimpath -ldflags="-s -w"`). Equivalent manual build:
+The script uses the same canonical flags as the CI build
+(`-trimpath -ldflags="-s -w"`). It does not set `CGO_ENABLED=0`, so a
+source build may be dynamically linked against the host libc, unlike the
+fully static release archives below. Equivalent manual build:
 
 ```bash
 mkdir -p dist
@@ -65,12 +78,16 @@ go build -trimpath -ldflags="-s -w" -o dist/tui    ./cmd/tui
 
 ### Option B — download a release archive
 
-`.github/workflows/release.yml` publishes static archives
-(`CGO_ENABLED=0`) for `linux/{amd64,arm64}` and `darwin/{amd64,arm64}`,
-each with an SBOM and build-provenance attestation. Download the archive
-matching your `GOOS/GOARCH`, verify the attestation with
-`gh attestation verify`, then unpack `worker` (and optionally `tui`)
-onto the host `PATH`.
+`.github/workflows/release.yml` publishes one fully static
+(`CGO_ENABLED=0`) archive per platform —
+`aiops-platform_<tag>_<goos>_<goarch>.tar.gz` for `linux/{amd64,arm64}`
+and `darwin/{amd64,arm64}`, each containing both `worker` and `tui` —
+plus a single aggregate CycloneDX SBOM
+(`aiops-platform_<tag>_sbom.cdx.json`) and a build-provenance attestation
+covering all release assets. Download the archive matching your
+`GOOS/GOARCH`, verify its provenance with
+`gh attestation verify <archive> --repo xrf9268-hue/aiops-platform`,
+then unpack `worker` (and optionally `tui`) onto the host `PATH`.
 
 ## 3. Configure the workflow and environment
 
@@ -97,6 +114,18 @@ sudo cp .env.example /etc/aiops-platform/worker.env           # fill in the toke
 sudo chmod 600 /etc/aiops-platform/worker.env
 ```
 
+`examples/WORKFLOW.md` and `.env.example` ship in the source checkout
+(Option A). If you installed from a release archive (Option B), the
+archive contains only the binaries — copy these two files from the repo,
+or author a `WORKFLOW.md` from the README configuration table and a
+minimal env file by hand.
+
+The paths above use the Linux FHS layout (`/etc`, `/var/lib`). On macOS
+the conventional equivalents are `/usr/local/etc/aiops-platform` and
+`/usr/local/var/aiops-platform` (Homebrew prefix), or a per-user
+`~/Library/Application Support/aiops-platform`. The §5 launchd example
+uses the `/usr/local` paths; substitute consistently.
+
 Keep `agent.default: mock` in `WORKFLOW.md` until the loop is trusted on
 the target repo.
 
@@ -112,6 +141,12 @@ worker --doctor --mode=mock "$AIOPS_WORKFLOW_PATH"
 worker --doctor --mode=real "$AIOPS_WORKFLOW_PATH"
 ```
 
+On a Docker-less binary host, the "Docker Compose" check is a `WARN` in
+`--mode=mock` but is escalated to a `FAIL` (non-zero exit) in
+`--mode=real`. Treat that single Compose `FAIL` as expected on this
+deployment path and read the tracker/agent/workflow checks for the real
+verdict — see §1 on the doctor's container-centric wording.
+
 Inspect the effective config (secrets are masked with `***`):
 
 ```bash
@@ -123,11 +158,15 @@ worker --print-config "$(dirname "$AIOPS_WORKFLOW_PATH")"
 ### Foreground (development)
 
 ```bash
-export AIOPS_WORKFLOW_PATH=/etc/aiops-platform/WORKFLOW.md
-export AIOPS_WORKSPACE_ROOT=/var/lib/aiops-platform/workspaces
+export AIOPS_WORKFLOW_PATH=$PWD/WORKFLOW.md
+export AIOPS_WORKSPACE_ROOT=$PWD/.aiops/workspaces   # any path the user can write
 export LINEAR_API_KEY=...        # only the var your WORKFLOW.md tracker.api_key references
 worker
 ```
+
+This works the same on Linux and macOS. Use a user-writable workspace
+root here; the system paths in §3 are owned by the service user and are
+for the supervised setups below.
 
 The worker exposes a loopback-only HTTP server on
 `127.0.0.1:${server.port}` (default `4000`): `/livez`, `/readyz`
@@ -137,7 +176,7 @@ host with `AIOPS_SERVER_HOST`. The dashboard/state API is unauthenticated
 on pure loopback; if you bind anything other than loopback, require a
 token via `AIOPS_STATE_API_TOKEN` — see README "Operator surfaces".
 
-### Under systemd (production)
+### Linux: under systemd (production)
 
 A hardened sample unit ships at
 [`deploy/systemd/aiops-worker.service`](../../deploy/systemd/aiops-worker.service).
@@ -146,8 +185,9 @@ hardening in #365), loads secrets from an `EnvironmentFile`, and keeps
 mutable state under `/var/lib/aiops-platform` via `StateDirectory`.
 
 ```bash
-# one-time: create the service user and state dir
-sudo useradd --system --create-home --home-dir /var/lib/aiops-platform \
+# one-time: create the service user. StateDirectory= creates and chowns
+# /var/lib/aiops-platform on first start, so --create-home is not needed.
+sudo useradd --system --home-dir /var/lib/aiops-platform \
   --shell /usr/sbin/nologin aiops
 
 # install the binary and unit
@@ -166,21 +206,108 @@ Edit the unit's `EnvironmentFile=` / `ExecStart=` paths if you installed
 the binary or config elsewhere. If you set `server.port: -1` to disable
 the HTTP server, drop any external health probe that targets it.
 
+**SSH deploy key under hardening.** The unit sets `ProtectHome=true`,
+which makes `/home`, `/root`, and `/run/user` inaccessible — but **not**
+`/var/lib`. Because the unit sets the `aiops` user's `$HOME` to its state
+dir (`/var/lib/aiops-platform`), place the agent's git deploy key at
+`/var/lib/aiops-platform/.ssh/id_ed25519` (owned by `aiops`, mode `0600`)
+so `ssh` resolves it via `$HOME/.ssh` and `ReadWritePaths=` already
+covers it:
+
+```bash
+sudo -u aiops install -d -m 700 /var/lib/aiops-platform/.ssh
+sudo -u aiops ssh-keygen -t ed25519 -N '' \
+  -f /var/lib/aiops-platform/.ssh/id_ed25519 -C aiops-worker-deploy-key
+# register /var/lib/aiops-platform/.ssh/id_ed25519.pub as a deploy key, then:
+sudo -u aiops bash -c 'ssh-keyscan -H <git-host> >> /var/lib/aiops-platform/.ssh/known_hosts'
+```
+
+A key left under a conventional home such as `/home/aiops/.ssh` is hidden
+by `ProtectHome=true` and the agent's `git push` over SSH then fails with
+a confusing missing-key/auth error. For the same reason the unit pins
+`AIOPS_MIRROR_ROOT` inside the state dir: the worker's default mirror root
+is `os.UserCacheDir()/aiops-platform/mirrors`, which would otherwise
+resolve under `$HOME` and must stay within `ReadWritePaths=`.
+
+### macOS: under launchd
+
+A sample per-user LaunchAgent ships at
+[`deploy/launchd/com.aiops-platform.worker.plist`](../../deploy/launchd/com.aiops-platform.worker.plist).
+launchd has no sandboxing directives equivalent to systemd's, so the
+hardening here is "run as an ordinary (non-admin) user with least
+filesystem footprint" plus keeping the secret out of the plist (below).
+It uses the `/usr/local` paths from §3.
+
+```bash
+# install the binaries onto PATH
+sudo scripts/install.sh --prefix /usr/local
+
+# config + state/log dir owned by the running user (the plist logs here)
+sudo install -d -o "$USER" /usr/local/etc/aiops-platform
+mkdir -p /usr/local/var/aiops-platform
+cp examples/WORKFLOW.md /usr/local/etc/aiops-platform/WORKFLOW.md   # edit tracker.api_key/kind
+
+# install and load the agent (per-user; runs only while you are logged in)
+cp deploy/launchd/com.aiops-platform.worker.plist ~/Library/LaunchAgents/
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.aiops-platform.worker.plist
+launchctl enable "gui/$(id -u)/com.aiops-platform.worker"
+
+# observe
+launchctl print "gui/$(id -u)/com.aiops-platform.worker" | head -n 40
+tail -f /usr/local/var/aiops-platform/worker.err.log
+curl http://127.0.0.1:4000/api/v1/state
+```
+
+For a machine-wide daemon that runs without a login session, install the
+plist into `/Library/LaunchDaemons/` instead, add a `UserName` key, and
+bootstrap into the `system` domain (`sudo launchctl bootstrap system …`).
+
+**Secrets on macOS.** launchd has no `EnvironmentFile=` equivalent, and a
+token pasted into the plist's `EnvironmentVariables` is readable by the
+user and lands in backups. Prefer the login Keychain plus a thin wrapper
+that exports the token before exec, keeping the plist secret-free:
+
+```bash
+# store once
+security add-generic-password -a "$USER" -s aiops-linear-api-key -w 'your-token'
+```
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/bin/aiops-worker-launch — point ProgramArguments at this.
+set -euo pipefail
+LINEAR_API_KEY="$(security find-generic-password -a "$USER" -s aiops-linear-api-key -w)"
+export LINEAR_API_KEY
+exec /usr/local/bin/worker
+```
+
+SSH keys on macOS need no special placement — `ProtectHome` does not
+exist, so a standard `~/.ssh/id_ed25519` for the running user works.
+
+> The existing [`scripts/install-local-launchagents.sh`](../../scripts/install-local-launchagents.sh)
+> is a different, higher-level macOS flow that bundles a GitHub worker
+> wrapper and a PR follow-through agent
+> (see [`github-local-automation.md`](github-local-automation.md)); use
+> the plist above when you just want the bare worker binary as a service.
+
 ## Common failure modes
 
 - **`missing_tracker_api_key` at startup** — `tracker.api_key` references
   a `$VAR` that is unset. Confirm the env var is exported in the same
   environment as the worker (for systemd, that it is present in
-  `EnvironmentFile`).
+  `EnvironmentFile`; for launchd, that the Keychain wrapper exported it).
 - **Agent cannot push** — the worker does not hold git credentials;
   provide a file-backed credential (e.g. a dedicated SSH deploy key) the
-  agent subprocess can read. See [`local-dev.md`](local-dev.md)
-  "Agent fails to push or open PRs".
+  agent subprocess can read. Under the systemd unit the key must live
+  inside the state dir (see §5 "SSH deploy key under hardening"), because
+  `ProtectHome=true` hides keys under `/home`. See also
+  [`local-dev.md`](local-dev.md) "Agent fails to push or open PRs".
 - **`/api/v1/state` refuses to bind** — the server is loopback-only and
   disabled when `server.port: -1`. Confirm with `worker --print-config`.
-- **Workspace permission errors under systemd** — ensure
+- **Workspace permission errors under a service manager** — ensure
   `AIOPS_WORKSPACE_ROOT` and `AIOPS_MIRROR_ROOT` point at directories the
-  `aiops` user owns (the sample unit uses `StateDirectory`).
+  running user owns (the systemd unit uses `StateDirectory`; the launchd
+  agent runs as your user and writes under `/usr/local/var`).
 
 ## See also
 

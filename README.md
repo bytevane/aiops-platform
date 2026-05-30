@@ -113,9 +113,9 @@ next poll rather than restoring queue rows, retry timers, or running sessions
 from a database.
 
 The worker is a self-contained binary with no container runtime dependency.
-To run it directly under an init system instead of Compose — build/install,
-`worker --doctor` preflight, and a hardened systemd unit — see the
-[binary deployment runbook](docs/runbooks/binary-deployment.md).
+To run it directly under a service manager instead of Compose — build/install,
+`worker --doctor` preflight, and Linux (systemd) / macOS (launchd) samples —
+see the [binary deployment runbook](docs/runbooks/binary-deployment.md).
 
 The default Compose service starts `worker`:
 
