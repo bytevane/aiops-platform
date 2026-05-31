@@ -285,20 +285,8 @@ var supportedTrackerKinds = map[string]struct{}{
 // error with the workflow file path attached.
 var supportedAgentDefaults = map[string]struct{}{
 	"mock":             {},
-	"codex":            {},
 	"codex-app-server": {},
 	"claude":           {},
-}
-
-// supportedCodexProfiles enumerates the codex runner profile names the
-// runner package knows how to dispatch. "safe" injects --sandbox
-// workspace-write + --skip-git-repo-check; "bypass" swaps in
-// --dangerously-bypass-approvals-and-sandbox for already-isolated hosts;
-// "custom" falls back to the operator-supplied codex.command via sh -c.
-var supportedCodexProfiles = map[string]struct{}{
-	"safe":   {},
-	"bypass": {},
-	"custom": {},
 }
 
 var supportedSandboxBackends = map[string]struct{}{
@@ -352,14 +340,54 @@ func rejectRemovedFields(front []byte) error {
 	if err := yaml.Unmarshal(front, &raw); err != nil {
 		return nil
 	}
-	agent, ok := raw["agent"].(map[string]any)
+	if err := rejectRemovedCodexFields(raw); err != nil {
+		return err
+	}
+	if claude, ok := raw["claude"].(map[string]any); ok {
+		if _, present := claude["profile"]; present {
+			return fmt.Errorf("claude.profile is not supported; the codex-only `profile` field was removed in issue #541 and Claude never had runner profiles. Remove it")
+		}
+	}
+	if agent, ok := raw["agent"].(map[string]any); ok {
+		if _, present := agent["fallback"]; present {
+			return fmt.Errorf("agent.fallback is no longer supported (issue #40); the worker never read this field. Remove it and set agent.default to a more reliable runner if you need a different default")
+		}
+	}
+	return nil
+}
+
+// rejectRemovedCodexFields surfaces clear errors for codex.* keys that
+// configured the removed one-shot `codex exec` runner (issue #541): the
+// `codex.profile` field and a `codex.command` whose argv runs `codex exec`.
+// Both would otherwise be silently dropped or fall through to a `sh -c
+// "codex exec"` launch that the app-server runner cannot speak, failing the
+// first real run with an opaque protocol/timeout error.
+func rejectRemovedCodexFields(raw map[string]any) error {
+	codex, ok := raw["codex"].(map[string]any)
 	if !ok {
 		return nil
 	}
-	if _, present := agent["fallback"]; present {
-		return fmt.Errorf("agent.fallback is no longer supported (issue #40); the worker never read this field. Remove it and set agent.default to a more reliable runner if you need a different default")
+	if _, present := codex["profile"]; present {
+		return fmt.Errorf("codex.profile is no longer supported (issue #541); the one-shot `codex exec` runner it configured was removed. The SPEC §10 runner is `codex app-server` (agent.default: codex-app-server); set its sandbox with codex.thread_sandbox / codex.turn_sandbox_policy instead")
+	}
+	if command, ok := codex["command"].(string); ok && commandRunsCodexExec(command) {
+		return fmt.Errorf("codex.command %q runs the removed one-shot `codex exec` runner (issue #541); the SPEC §10 runner is `codex app-server` — set codex.command to `codex app-server`", command)
 	}
 	return nil
+}
+
+// commandRunsCodexExec reports whether a codex.command launches the removed
+// one-shot `codex exec` runner (issue #541). It is a deliberately conservative
+// load-time guard: quote characters are stripped before tokenizing so quoted
+// spellings (e.g. `"codex" "exec"`) are caught too. The runner's
+// splitAppServerCommand is the authoritative launch-time parser — this only
+// exists to turn the otherwise opaque app-server JSON-RPC handshake failure into
+// a clear config error at load. Over-rejecting a pathological quoted command is
+// the safe direction (fail fast) versus silently launching the removed runner.
+func commandRunsCodexExec(command string) bool {
+	unquoted := strings.NewReplacer(`"`, "", `'`, "").Replace(command)
+	fields := strings.Fields(unquoted)
+	return len(fields) >= 2 && fields[0] == "codex" && fields[1] == "exec"
 }
 
 var knownTopLevelWorkflowKeys = map[string]struct{}{
@@ -532,9 +560,6 @@ func expandConfigForWorkflowPath(workflowPath string, cfg *Config) error { //nol
 	}
 	if cfg.Tracker.Statuses.Rework == "" {
 		cfg.Tracker.Statuses.Rework = "Rework"
-	}
-	if cfg.Codex.Profile == "" {
-		cfg.Codex.Profile = "safe"
 	}
 	if cfg.Sandbox.Backend == "" {
 		cfg.Sandbox.Backend = "none"

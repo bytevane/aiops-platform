@@ -45,7 +45,7 @@ After the queue, workspace, and agent-side branch/PR handoff loop works, switch 
 
 ```yaml
 agent:
-  default: codex
+  default: codex-app-server
 ```
 
 For company repositories, keep human review in the loop and prefer draft pull requests.
@@ -59,7 +59,7 @@ Implemented:
 - GitHub issue polling trigger (`tracker.kind: github`, wired through
   `cmd/worker` and `internal/tracker/github.go`)
 - repo-owned `WORKFLOW.md` in the service/repository root (single canonical path; see `DEVIATIONS.md` D4 closure)
-- mock, codex, and claude runner abstraction
+- mock, codex-app-server, and claude runner abstraction
 - deterministic local workspace keyed by sanitized source issue identifier (`source_type` + `source_event_id`), so reruns for the same issue reuse the same path while receiving a fresh checkout
 - basic path policy
 - verification commands

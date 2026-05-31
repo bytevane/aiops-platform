@@ -21,7 +21,7 @@ D8 (#76), it has stopped owning behaviors that earlier prototypes included:
   active issues on the next poll.
 - **No PR creation, no tracker writes.** The worker prepares a
   deterministic Git workspace, runs the configured agent (`mock`,
-  `codex`, or `claude`), enforces policy, and stops. Push, draft-PR
+  `codex-app-server`, or `claude`), enforces policy, and stops. Push, draft-PR
   creation, and tracker label transitions happen agent-side via the
   configured tool surface (`linear_graphql`, the workflow prompt's
   push step, etc.), not in `cmd/worker`.
@@ -46,7 +46,7 @@ needs Postgres, it is stale — file an issue.
   binary under an init system instead, see the
   [binary deployment runbook](binary-deployment.md).
 - Optional: the Codex CLI installed and on `PATH`, only if you set
-  `agent.default: codex` and want a real model loop.
+  `agent.default: codex-app-server` and want a real model loop.
 
 `cmd/worker` does **not** need Postgres.
 
