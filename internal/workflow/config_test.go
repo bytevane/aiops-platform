@@ -1844,6 +1844,51 @@ prompt body
 	}
 }
 
+// TestLoad_RejectsRemovedVerifyExecutionFields verifies that workflows still
+// carrying the worker-execution-only verify keys removed in #557
+// (verify.timeout / allow_failure / env_passthrough) fail Load with a clear
+// error instead of being silently accepted while the worker ignores them —
+// verification is the agent's job now. verify.commands stays valid.
+func TestLoad_RejectsRemovedVerifyExecutionFields(t *testing.T) {
+	const head = "---\nrepo:\n  owner: o\n  name: r\n  clone_url: git@example.com:o/r.git\ntracker:\n  kind: gitea\n"
+	for _, tc := range []struct{ name, block string }{
+		{"timeout", "verify:\n  timeout: 5m\n"},
+		{"allow_failure", "verify:\n  allow_failure: true\n"},
+		{"env_passthrough", "verify:\n  env_passthrough:\n    - GOMODCACHE\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			p := filepath.Join(dir, "WORKFLOW.md")
+			if err := os.WriteFile(p, []byte(head+tc.block+"---\nprompt body\n"), 0o644); err != nil {
+				t.Fatalf("write workflow: %v", err)
+			}
+			_, err := Load(p)
+			if err == nil {
+				t.Fatalf("Load(verify.%s present) = nil; want rejection error", tc.name)
+			}
+			if msg := err.Error(); !strings.Contains(msg, "verify."+tc.name) {
+				t.Fatalf("Load(verify.%s) error = %q; want substring %q", tc.name, msg, "verify."+tc.name)
+			}
+		})
+	}
+
+	t.Run("commands still accepted", func(t *testing.T) {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "WORKFLOW.md")
+		body := head + "verify:\n  commands:\n    - go test ./...\n---\nprompt body\n"
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatalf("write workflow: %v", err)
+		}
+		wf, err := Load(p)
+		if err != nil {
+			t.Fatalf("Load(verify.commands) = %v; want nil", err)
+		}
+		if got := wf.Config.Verify.Commands; len(got) != 1 || got[0] != "go test ./..." {
+			t.Fatalf("Verify.Commands = %v; want [go test ./...]", got)
+		}
+	})
+}
+
 // TestLoad_RejectsRemovedCodexProfile verifies that workflows still carrying
 // the removed `codex.profile` key fail Load with an error pointing at the SPEC
 // §10 app-server runner. The one-shot `codex exec` runner the profile
@@ -2413,29 +2458,6 @@ prompt
 	}
 	if got != want {
 		t.Fatalf("Tracker.Statuses = %#v, want %#v", got, want)
-	}
-}
-
-func TestLoad_VerifyTimeoutAndAllowFailureRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	body := "---\n" +
-		"repo:\n  owner: o\n  name: r\n  clone_url: git@example.com:o/r.git\n" +
-		"verify:\n  timeout: 5m\n  allow_failure: true\n  commands:\n    - go test ./...\n" +
-		"tracker:\n  kind: gitea\n" +
-		"---\nprompt\n"
-	p := filepath.Join(dir, "WORKFLOW.md")
-	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-	wf, err := Load(p)
-	if err != nil {
-		t.Fatalf("Load: %v", err)
-	}
-	if got, want := wf.Config.Verify.Timeout, 5*time.Minute; got != want {
-		t.Fatalf("Verify.Timeout = %v, want %v", got, want)
-	}
-	if !wf.Config.Verify.AllowFailure {
-		t.Fatalf("Verify.AllowFailure = false, want true")
 	}
 }
 
