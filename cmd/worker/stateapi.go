@@ -42,7 +42,16 @@ type apiStateResponse struct {
 	Retrying                   []apiStateRetry        `json:"retrying"`
 	Completed                  []orchestrator.IssueID `json:"completed"`
 	Failed                     []orchestrator.IssueID `json:"failed"`
-	CodexTotals                apiCodexTotals         `json:"codex_totals"`
+	// ReconcileStoppedWithProgress lists reconcile-stopped runs that had completed ≥1
+	// agent turn (made progress — usually the agent's handoff, but turn_completed
+	// fires after every turn, so it can also be a run stopped after an intermediate
+	// turn; inspect to confirm, it is not a guaranteed success) before the per-tick
+	// reconcile reaped them — surfaced so a progressed-but-reaped run is visible
+	// rather than absent from both completed and failed (#557). It does not overlap
+	// completed: a reconcile-stopped run is not a clean §16.5 exit, matching
+	// upstream's accounting, so completed stays unchanged.
+	ReconcileStoppedWithProgress []orchestrator.IssueID `json:"reconcile_stopped_with_progress"`
+	CodexTotals                  apiCodexTotals         `json:"codex_totals"`
 	// RateLimits is the latest Codex rate-limit payload (SPEC §13.7.2). It
 	// is emitted unconditionally — `null` until a `rate_limit_updated`
 	// notification is observed — so operators can rely on the key always
@@ -83,6 +92,13 @@ type apiStateCounts struct {
 	// lifetime number when the bounded sets have rotated.
 	CompletedTotal int64 `json:"completed_total"`
 	FailedTotal    int64 `json:"failed_total"`
+	// ReconcileStoppedWithProgress is the size of the FIFO-bounded recent set of
+	// reconcile-stopped runs that had made progress (≥1 completed turn; the same set
+	// published as `state.reconcile_stopped_with_progress`);
+	// ReconcileStoppedWithProgressTotal is the lifetime monotonic counter that
+	// survives FIFO eviction (#557).
+	ReconcileStoppedWithProgress      int   `json:"reconcile_stopped_with_progress"`
+	ReconcileStoppedWithProgressTotal int64 `json:"reconcile_stopped_with_progress_total"`
 }
 type apiStateRunning struct {
 	IssueID    orchestrator.IssueID `json:"issue_id"`
@@ -363,7 +379,9 @@ func apiTerminalIssueFromView(view orchestrator.StateView, normalizedWant string
 	}
 	for i := len(view.RecentEvents) - 1; i >= 0; i-- {
 		ev := view.RecentEvents[i]
-		if ev.Kind != orchestrator.RuntimeEventCompleted && ev.Kind != orchestrator.RuntimeEventFailed {
+		if ev.Kind != orchestrator.RuntimeEventCompleted &&
+			ev.Kind != orchestrator.RuntimeEventFailed &&
+			ev.Kind != orchestrator.RuntimeEventReconcileStopped {
 			continue
 		}
 		if !matchesIssueLookup(ev.IssueID, ev.Identifier, normalizedWant) {
@@ -384,6 +402,15 @@ func apiTerminalIssueFromView(view orchestrator.StateView, normalizedWant string
 	for _, issueID := range view.Failed {
 		if matchesIssueLookup(issueID, "", normalizedWant) {
 			return base(issueID, string(issueID), "failed"), true
+		}
+	}
+	// Keep the per-issue lookup consistent with the aggregate: an ID surfaced in
+	// reconcile_stopped_with_progress must be drillable here instead of returning
+	// issue_not_found (#557). Checked after completed/failed so a later clean exit
+	// or terminal failure for the same id takes precedence.
+	for _, issueID := range view.ReconcileStoppedWithProgress {
+		if matchesIssueLookup(issueID, "", normalizedWant) {
+			return base(issueID, string(issueID), "reconcile_stopped_with_progress"), true
 		}
 	}
 	return apiIssueResponse{}, false
@@ -543,17 +570,22 @@ func apiStateFromView(view orchestrator.StateView) apiStateResponse {
 	sort.Slice(failed, func(i, j int) bool {
 		return failed[i] < failed[j]
 	})
+	reconcileFinished := append([]orchestrator.IssueID(nil), view.ReconcileStoppedWithProgress...)
+	sort.Slice(reconcileFinished, func(i, j int) bool {
+		return reconcileFinished[i] < reconcileFinished[j]
+	})
 	return apiStateResponse{
-		GeneratedAt:                generatedAt,
-		PollIntervalMs:             view.PollIntervalMs,
-		MaxConcurrentAgents:        view.MaxConcurrentAgents,
-		MaxConcurrentAgentsByState: copyConcurrencyLimits(view.MaxConcurrentAgentsByState),
-		Counts:                     apiCountsFromView(view),
-		Running:                    running,
-		Blocked:                    blocked,
-		Retrying:                   retrying,
-		Completed:                  completed,
-		Failed:                     failed,
+		GeneratedAt:                  generatedAt,
+		PollIntervalMs:               view.PollIntervalMs,
+		MaxConcurrentAgents:          view.MaxConcurrentAgents,
+		MaxConcurrentAgentsByState:   copyConcurrencyLimits(view.MaxConcurrentAgentsByState),
+		Counts:                       apiCountsFromView(view),
+		Running:                      running,
+		Blocked:                      blocked,
+		Retrying:                     retrying,
+		Completed:                    completed,
+		Failed:                       failed,
+		ReconcileStoppedWithProgress: reconcileFinished,
 		CodexTotals: apiCodexTotals{
 			InputTokens:    view.CodexTotals.InputTokens,
 			OutputTokens:   view.CodexTotals.OutputTokens,
@@ -585,13 +617,15 @@ func sortedAPIRetryRows(rows []orchestrator.RetryView) []apiStateRetry {
 }
 func apiCountsFromView(view orchestrator.StateView) apiStateCounts {
 	return apiStateCounts{
-		Running:        len(view.Running),
-		Blocked:        len(view.Blocked),
-		Retrying:       len(view.Retrying),
-		Completed:      len(view.Completed),
-		Failed:         view.FailedSuppressedCount,
-		CompletedTotal: view.CumulativeCompletedTotal,
-		FailedTotal:    view.CumulativeFailedTotal,
+		Running:                           len(view.Running),
+		Blocked:                           len(view.Blocked),
+		Retrying:                          len(view.Retrying),
+		Completed:                         len(view.Completed),
+		Failed:                            view.FailedSuppressedCount,
+		CompletedTotal:                    view.CumulativeCompletedTotal,
+		FailedTotal:                       view.CumulativeFailedTotal,
+		ReconcileStoppedWithProgress:      len(view.ReconcileStoppedWithProgress),
+		ReconcileStoppedWithProgressTotal: view.CumulativeReconcileStoppedWithProgressTotal,
 	}
 }
 func copyRateLimitsForAPI(src *orchestrator.RateLimitSnapshot) *orchestrator.RateLimitSnapshot {
