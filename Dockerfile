@@ -70,12 +70,12 @@ ARG AIOPS_GID=1000
 USER root
 COPY --from=build /usr/local/go /usr/local/go
 ENV PATH="/usr/local/go/bin:${PATH}"
-ARG CODEX_CLI_VERSION=0.133.0
+ARG CODEX_CLI_VERSION=0.137.0
 ARG TARGETARCH
 RUN set -eux; \
     case "${TARGETARCH}" in \
-      amd64) codex_arch="x86_64-unknown-linux-musl"; codex_sha="cad5f38b92247186a532157111ea43edca77d3427eb6127e603b7887db484473" ;; \
-      arm64) codex_arch="aarch64-unknown-linux-musl"; codex_sha="7a77d416f9ce16f18e09fdc57622a15aab6ad131c34e078ab9d55a13bb3d9b05" ;; \
+      amd64) codex_arch="x86_64-unknown-linux-musl"; codex_sha="b364488097efd12da3b5ffb1b0099cabd8b377b1f97043158f7f771b1456953f" ;; \
+      arm64) codex_arch="aarch64-unknown-linux-musl"; codex_sha="8756c80ad058199676d058bbd919812466d796886e7574a57c4e007f766e707c" ;; \
       *) echo "unsupported TARGETARCH=${TARGETARCH}; supported: amd64, arm64" >&2; exit 1 ;; \
     esac; \
     url="https://github.com/openai/codex/releases/download/rust-v${CODEX_CLI_VERSION}/codex-package-${codex_arch}.tar.gz"; \
