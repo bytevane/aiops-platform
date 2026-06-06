@@ -1233,3 +1233,150 @@ func TestMirrorPathFor_StableAcrossSchemes(t *testing.T) {
 		}
 	}
 }
+
+// TestMirrorPathFor_ContainsHostileCloneURLs is the #665 regression: a
+// malformed clone URL path (path-traversal hops, backslashes, empty/garbage
+// input) must never let mirrorPathFor escape the mirror root. clone_url is
+// operator-controlled config, so this is defense-in-depth containment rather
+// than an externally-triggerable escape — but the derived filesystem path must
+// stay under root regardless of input shape.
+func TestMirrorPathFor_ContainsHostileCloneURLs(t *testing.T) {
+	const root = "/cache"
+	// want is the exact structured path each hostile URL maps to. Asserting the
+	// precise path (not merely "is it contained") pins down layer 1: every "."
+	// or ".." segment becomes "unknown" and the readable host/owner/repo layout
+	// survives, so a hostile URL gets a sane structured path rather than the
+	// containment backstop's flat fallback. Reverting the per-segment sanitizer
+	// would route these through the fallback and fail the exact match.
+	cases := []struct {
+		in   string
+		want string // forward-slash form; converted per-OS below
+	}{
+		{"https://host/../../evil.git", "/cache/host/unknown/unknown/evil.git"},
+		{"git@host:../../evil.git", "/cache/host/unknown/unknown/evil.git"},
+		{"https://host/a/../evil.git", "/cache/host/a/unknown/evil.git"},
+		{"https://../owner/repo.git", "/cache/unknown/owner/repo.git"},
+		{`..\evil.git`, "/cache/unknown/.._evil.git"},
+		{`https://host/..\..\evil.git`, "/cache/host/.._.._evil.git"},
+		{"https://host/../../../../../../etc/passwd", "/cache/host/unknown/unknown/unknown/unknown/unknown/unknown/etc/passwd.git"},
+		{"", "/cache/unknown/repo.git"},
+		{"   ", "/cache/unknown/repo.git"},
+		{"not a url", "/cache/unknown/not_a_url.git"},
+	}
+	for _, tc := range cases {
+		want := filepath.FromSlash(tc.want)
+		got := mirrorPathFor(root, tc.in)
+		if got != want {
+			t.Errorf("mirrorPathFor(%q) = %q; want %q", tc.in, got, want)
+		}
+		// Independently of the exact-path assertion above, the result must stay
+		// strictly under root for every input shape (#665).
+		assertMirrorUnderRoot(t, root, tc.in, got)
+		// Derivation is deterministic: the same clone URL maps to the same path.
+		if again := mirrorPathFor(root, tc.in); again != got {
+			t.Errorf("mirrorPathFor(%q) not deterministic: %q then %q", tc.in, got, again)
+		}
+	}
+}
+
+// assertMirrorUnderRoot fails the test unless got resolves to a location
+// strictly below root. It recomputes containment independently of the
+// production helper (filepath.Rel on absolute paths) so a bug in
+// pathContainedUnder cannot mask an actual escape, and it uses Rel rather than
+// a string prefix so a sibling like "<root>-evil" is correctly rejected.
+func assertMirrorUnderRoot(t *testing.T, root, in, got string) {
+	t.Helper()
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		t.Fatalf("Abs(%q): %v", root, err)
+	}
+	gotAbs, err := filepath.Abs(got)
+	if err != nil {
+		t.Fatalf("Abs(%q): %v", got, err)
+	}
+	rel, err := filepath.Rel(rootAbs, gotAbs)
+	if err != nil {
+		t.Fatalf("mirrorPathFor(%q) = %q; Rel(%q, %q): %v", in, got, rootAbs, gotAbs, err)
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		t.Errorf("mirrorPathFor(%q) = %q; want a path strictly under root %q (rel = %q)", in, got, rootAbs, rel)
+	}
+}
+
+func TestPathContainedUnder(t *testing.T) {
+	root := filepath.FromSlash("/cache/mirrors")
+	cases := []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"direct child", filepath.Join(root, "host", "repo.git"), true},
+		{"deep child", filepath.Join(root, "a", "b", "c.git"), true},
+		{"root itself", root, false},
+		{"parent escape", filepath.Join(root, "..", "evil.git"), false},
+		{"grandparent escape", filepath.Join(root, "..", "..", "evil.git"), false},
+		{"sibling sharing prefix", root + "-evil", false},
+		{"unrelated absolute path", filepath.FromSlash("/etc/passwd"), false},
+	}
+	for _, tc := range cases {
+		if got := pathContainedUnder(root, tc.path); got != tc.want {
+			t.Errorf("pathContainedUnder(%q, %q) [%s] = %v; want %v", root, tc.path, tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestMirrorPathUnderRoot_FallsBackOnEscape drives the containment backstop
+// directly. The per-segment sanitizer in mirrorPathFor means a real clone URL
+// never produces an escaping candidate, so this is the only path that exercises
+// the fallback branch — without it, that branch would be an untested placebo.
+func TestMirrorPathUnderRoot_FallsBackOnEscape(t *testing.T) {
+	root := t.TempDir()
+
+	good := filepath.Join(root, "host", "owner", "repo.git")
+	if got := mirrorPathUnderRoot(root, good, "https://host/owner/repo.git"); got != good {
+		t.Errorf("mirrorPathUnderRoot(root, contained) = %q; want %q unchanged", got, good)
+	}
+
+	escape := filepath.Join(root, "..", "..", "evil.git")
+	url := "https://host/../../evil.git"
+	got := mirrorPathUnderRoot(root, escape, url)
+	if !pathContainedUnder(root, got) {
+		t.Errorf("mirrorPathUnderRoot(root, escaping %q) = %q; want a path under root %q", escape, got, root)
+	}
+	if again := mirrorPathUnderRoot(root, escape, url); again != got {
+		t.Errorf("mirrorPathUnderRoot fallback not deterministic for %q: %q then %q", url, got, again)
+	}
+	if other := mirrorPathUnderRoot(root, escape, "https://host/../../other.git"); other == got {
+		t.Errorf("mirrorPathUnderRoot collapsed distinct clone URLs onto the same fallback %q", got)
+	}
+}
+
+// TestMirrorPathFor_NormalEdgeComponents pins intentional, non-hostile
+// sanitization behaviour that the #665 switch to the shared sanitizeComponent
+// changed or exposed: a host with an explicit port has its ":" rewritten (the
+// old mirror sanitizer left it intact — the new behaviour is also Windows-safe);
+// dots/uppercase in owner/repo names are preserved (no behaviour change); and an
+// empty path component maps to "unknown" rather than relying on the (now
+// removed) empty-repoPath fallback branch.
+func TestMirrorPathFor_NormalEdgeComponents(t *testing.T) {
+	const root = "/cache"
+	cases := []struct {
+		in   string
+		want string
+	}{
+		// Host with an explicit port: ":" is now sanitized to "_".
+		{"https://gitea.example.com:8443/acme/demo.git", "/cache/gitea.example.com_8443/acme/demo.git"},
+		// Dots and uppercase in owner/repo are valid path chars, kept verbatim.
+		{"https://github.com/My.Org/My.Repo.git", "/cache/github.com/My.Org/My.Repo.git"},
+		// Empty trailing path component -> "unknown" (exercises the path the
+		// removed `if repoPath == ""` branch used to guard).
+		{"https://host/owner/.git", "/cache/host/owner/unknown.git"},
+		{"https://host/.git", "/cache/host/unknown.git"},
+	}
+	for _, tc := range cases {
+		want := filepath.FromSlash(tc.want)
+		if got := mirrorPathFor(root, tc.in); got != want {
+			t.Errorf("mirrorPathFor(%q) = %q; want %q", tc.in, got, want)
+		}
+	}
+}
