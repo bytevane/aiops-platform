@@ -78,23 +78,76 @@ func MirrorRoot(override string) string {
 
 // mirrorPathFor maps a clone URL to a stable on-disk location under root.
 // We do not need cryptographic uniqueness, just a deterministic, filesystem-
-// safe path keyed by host + path so two repos never collide. The trailing
-// ".git" is preserved to keep the layout recognisable when inspected by hand.
+// safe path keyed by the sanitized host + path. De-confliction is best-effort
+// and matches how sanitizeComponent is used for every other derived workspace
+// path: the shared sanitizer rewrites unsafe characters and caps each segment,
+// so two repos whose sanitized, length-capped segments coincide would share a
+// mirror directory. That is an accepted trade-off because clone_url is
+// operator-controlled config and real forge host/owner/repo names stay well
+// under the cap — not a "never collides" guarantee. The trailing ".git" is
+// preserved to keep the layout recognisable when inspected by hand.
 func mirrorPathFor(root, cloneURL string) string {
 	host, repoPath := splitCloneURL(cloneURL)
-	host = sanitizeMirrorComponent(host)
+	host = sanitizeComponent(host)
 	repoPath = strings.TrimSuffix(repoPath, ".git")
 	// Preserve owner/name structure so multiple repos under the same owner
-	// share a parent directory, which makes manual cleanup easier.
+	// share a parent directory, which makes manual cleanup easier. Each segment
+	// goes through the shared workspace component sanitizer, which maps
+	// ""/"."/".." to "unknown" and rewrites separators, backslashes, and control
+	// characters — so no segment can smuggle a path-traversal hop into the
+	// joined path (#665).
 	parts := strings.Split(repoPath, "/")
 	for i, p := range parts {
-		parts[i] = sanitizeMirrorComponent(p)
+		parts[i] = sanitizeComponent(p)
 	}
+	// strings.Split never yields an empty slice and sanitizeComponent maps the
+	// empty string to "unknown", so repoPath is always non-empty here; no
+	// empty-string fallback is needed (an empty clone URL is handled upstream in
+	// splitCloneURL, which returns "repo").
 	repoPath = strings.Join(parts, string(filepath.Separator))
-	if repoPath == "" {
-		repoPath = "repo"
+	candidate := filepath.Join(root, host, repoPath+".git")
+	return mirrorPathUnderRoot(root, candidate, cloneURL)
+}
+
+// mirrorPathUnderRoot returns candidate when it is contained under root, and a
+// deterministic, URL-keyed fallback path under root otherwise. The per-segment
+// sanitization in mirrorPathFor already neutralizes "."/".."/separators, so a
+// sanitized candidate cannot climb above root and this guard is a
+// defense-in-depth backstop: it guarantees mirror writes stay under the
+// configured root regardless of input shape, even if the sanitizer is later
+// weakened or splitCloneURL grows a new parsing branch (#665). clone_url is
+// operator-controlled config rather than an attacker channel, so this is
+// hardening, not a fix for an externally-triggerable escape.
+func mirrorPathUnderRoot(root, candidate, cloneURL string) string {
+	if pathContainedUnder(root, candidate) {
+		return candidate
 	}
-	return filepath.Join(root, host, repoPath+".git")
+	return filepath.Join(root, sanitizeComponent(cloneURL)+".git")
+}
+
+// pathContainedUnder reports whether path resolves to a location strictly below
+// root. It is a purely lexical check (filepath.Abs + filepath.Rel) because the
+// mirror directory does not exist yet at path-derivation time, so symlink
+// resolution is neither possible nor relevant here — the threat is a "../" hop
+// in the derived path, not a symlinked root. The root itself is not "contained"
+// (rel == "."): a mirror path is always a child, never the root directory.
+func pathContainedUnder(root, path string) bool {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	pathAbs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(rootAbs, pathAbs)
+	if err != nil {
+		return false
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return !filepath.IsAbs(rel)
 }
 
 // splitCloneURL extracts a host and path component from either an https://
@@ -123,16 +176,7 @@ func splitCloneURL(cloneURL string) (host, path string) {
 			return rest[:colon], rest[colon+1:]
 		}
 	}
-	return "unknown", sanitizeMirrorComponent(cloneURL)
-}
-
-func sanitizeMirrorComponent(s string) string {
-	s = strings.ReplaceAll(s, "/", "_")
-	s = strings.ReplaceAll(s, " ", "_")
-	if s == "" {
-		return "unknown"
-	}
-	return s
+	return "unknown", sanitizeComponent(cloneURL)
 }
 
 // EnsureMirror returns the local path to a bare mirror clone of cloneURL,
