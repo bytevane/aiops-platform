@@ -270,11 +270,14 @@ func (c *LinearClient) fetchLinearIssuesPage(ctx context.Context, vars map[strin
 	}
 	var issues []Issue
 	for _, n := range out.Data.Issues.Nodes {
-		iss, err := c.mapLinearIssueNode(ctx, n)
+		iss, err := mapLinearIssueNode(n)
 		if err != nil {
 			return nil, linearPageInfo{}, err
 		}
 		issues = append(issues, iss)
+	}
+	if err := c.attachLinearBlockers(ctx, issues); err != nil {
+		return nil, linearPageInfo{}, err
 	}
 	pageInfo := linearPageInfo{
 		HasNextPage: out.Data.Issues.PageInfo.HasNextPage,
@@ -283,10 +286,11 @@ func (c *LinearClient) fetchLinearIssuesPage(ctx context.Context, vars map[strin
 	return issues, pageInfo, nil
 }
 
-// mapLinearIssueNode maps one ListIssues node to a domain Issue. Blockers are
-// fetched only for Todo-state issues; createdAt is parsed before updatedAt so
-// the first malformed timestamp wins.
-func (c *LinearClient) mapLinearIssueNode(ctx context.Context, n linearIssueNode) (Issue, error) {
+// mapLinearIssueNode maps one ListIssues node to a domain Issue. createdAt is
+// parsed before updatedAt so the first malformed timestamp wins. Blockers are
+// not resolved here: attachLinearBlockers fills BlockedBy for the page's
+// Todo-state issues in one batched query (#672).
+func mapLinearIssueNode(n linearIssueNode) (Issue, error) {
 	createdAt, err := parseLinearIssueTime("createdAt", n.CreatedAt)
 	if err != nil {
 		return Issue{}, err
@@ -294,13 +298,6 @@ func (c *LinearClient) mapLinearIssueNode(ctx context.Context, n linearIssueNode
 	updatedAt, err := parseLinearIssueTime("updatedAt", n.UpdatedAt)
 	if err != nil {
 		return Issue{}, err
-	}
-	var blockers []BlockerRef
-	if isTodoState(n.State.Name) {
-		blockers, err = c.linearBlockersForIssue(ctx, n.ID)
-		if err != nil {
-			return Issue{}, err
-		}
 	}
 	labels := make([]string, 0, len(n.Labels.Nodes))
 	for _, label := range n.Labels.Nodes {
@@ -311,7 +308,7 @@ func (c *LinearClient) mapLinearIssueNode(ctx context.Context, n linearIssueNode
 	// Issue.CustomFields stays nil — Linear's GraphQL schema does not
 	// expose any custom-field data on Issue (introspection confirms
 	// only `customerTicketCount` matches `custom*`). See #326.
-	return Issue{ID: n.ID, Identifier: n.Identifier, Title: n.Title, Description: n.Description, URL: n.URL, Priority: n.Priority, BranchName: n.BranchName, CreatedAt: createdAt, UpdatedAt: updatedAt, Labels: labels, State: n.State.Name, BlockedBy: blockers}, nil
+	return Issue{ID: n.ID, Identifier: n.Identifier, Title: n.Title, Description: n.Description, URL: n.URL, Priority: n.Priority, BranchName: n.BranchName, CreatedAt: createdAt, UpdatedAt: updatedAt, Labels: labels, State: n.State.Name}, nil
 }
 
 func parseLinearIssueTime(field, value string) (time.Time, error) {
@@ -389,10 +386,55 @@ func isTodoState(state string) bool {
 	return strings.EqualFold(strings.TrimSpace(state), "Todo")
 }
 
-func (c *LinearClient) linearBlockersForIssue(ctx context.Context, issueID string) ([]BlockerRef, error) {
-	var out struct {
-		Data struct {
-			Issue struct {
+// attachLinearBlockers resolves blocker (inverse-relation) data for the page's
+// Todo-state issues in one batched query instead of one query per issue (#672).
+// Non-Todo issues never carry blockers, matching the prior per-issue behavior,
+// so their BlockedBy stays nil. Pagination of any single issue's
+// inverseRelations beyond the first page is preserved deeper in the call chain
+// by fetchLinearBlockerChunk -> linearBlockersFromInverseRelations.
+func (c *LinearClient) attachLinearBlockers(ctx context.Context, issues []Issue) error {
+	ids := make([]string, 0, len(issues))
+	for _, iss := range issues {
+		if isTodoState(iss.State) {
+			ids = append(ids, iss.ID)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	blockers, err := c.linearBlockersForIssues(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for i := range issues {
+		if isTodoState(issues[i].State) {
+			issues[i].BlockedBy = blockers[issues[i].ID]
+		}
+	}
+	return nil
+}
+
+// listLinearIssuesInverseRelationsQuery fetches the first inverseRelations page
+// for a batch of issue ids in a single request. It is a separate query from
+// listLinearIssuesQuery so the candidate-list query's complexity does not grow
+// per poll; the inverseRelations page size matches the per-issue overflow query
+// in linearBlockersFromInverseRelations.
+const listLinearIssuesInverseRelationsQuery = `query ListIssuesInverseRelations($ids: [ID!]!, $first: Int!) {
+  issues(filter: { id: { in: $ids } }, first: $first) {
+    nodes {
+      id
+      inverseRelations(first: 50) { nodes { type issue { id identifier state { name } } } pageInfo { hasNextPage endCursor } }
+    }
+  }
+}`
+
+// linearBatchInverseRelationsResponse is the batched first-page inverse-relations
+// payload returned by listLinearIssuesInverseRelationsQuery for a chunk of ids.
+type linearBatchInverseRelationsResponse struct {
+	Data struct {
+		Issues struct {
+			Nodes []struct {
+				ID               string `json:"id"`
 				InverseRelations struct {
 					Nodes    []linearRelationNode `json:"nodes"`
 					PageInfo struct {
@@ -400,22 +442,53 @@ func (c *LinearClient) linearBlockersForIssue(ctx context.Context, issueID strin
 						EndCursor   string `json:"endCursor"`
 					} `json:"pageInfo"`
 				} `json:"inverseRelations"`
-			} `json:"issue"`
-		} `json:"data"`
-		Errors []map[string]any `json:"errors"`
+			} `json:"nodes"`
+		} `json:"issues"`
+	} `json:"data"`
+	Errors []map[string]any `json:"errors"`
+}
+
+// linearBlockersForIssues fetches first-page inverse relations for every id in
+// one batched query per linearIssuePageSize chunk, then continues per-issue
+// pagination only for ids whose blockers overflow the first page. Every
+// requested id is present in the result (empty slice when it has no blockers)
+// so callers see the same non-nil empty BlockedBy the per-issue path produced.
+func (c *LinearClient) linearBlockersForIssues(ctx context.Context, ids []string) (map[string][]BlockerRef, error) {
+	result := make(map[string][]BlockerRef, len(ids))
+	for _, id := range ids {
+		result[id] = []BlockerRef{}
 	}
-	query := `query ListIssueInverseRelations($id: String!, $after: String) {
-  issue(id: $id) {
-    inverseRelations(first: 50, after: $after) { nodes { type issue { id identifier state { name } } } pageInfo { hasNextPage endCursor } }
-  }
-}`
-	if err := c.graphql(ctx, query, map[string]any{"id": issueID, "after": nil}, &out); err != nil {
-		return nil, err
+	for start := 0; start < len(ids); start += linearIssuePageSize {
+		end := start + linearIssuePageSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		if err := c.fetchLinearBlockerChunk(ctx, ids[start:end], result); err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+// fetchLinearBlockerChunk runs one batched inverse-relations query for chunk and
+// records each returned issue's blockers into result, paginating any single
+// issue's overflow pages via linearBlockersFromInverseRelations.
+func (c *LinearClient) fetchLinearBlockerChunk(ctx context.Context, chunk []string, result map[string][]BlockerRef) error {
+	var out linearBatchInverseRelationsResponse
+	if err := c.graphql(ctx, listLinearIssuesInverseRelationsQuery, map[string]any{"ids": chunk, "first": len(chunk)}, &out); err != nil {
+		return err
 	}
 	if len(out.Errors) > 0 {
-		return nil, linearGraphQLErrors(out.Errors)
+		return linearGraphQLErrors(out.Errors)
 	}
-	return c.linearBlockersFromInverseRelations(ctx, issueID, out.Data.Issue.InverseRelations.Nodes, out.Data.Issue.InverseRelations.PageInfo.HasNextPage, out.Data.Issue.InverseRelations.PageInfo.EndCursor)
+	for _, n := range out.Data.Issues.Nodes {
+		blockers, err := c.linearBlockersFromInverseRelations(ctx, n.ID, n.InverseRelations.Nodes, n.InverseRelations.PageInfo.HasNextPage, n.InverseRelations.PageInfo.EndCursor)
+		if err != nil {
+			return err
+		}
+		result[n.ID] = blockers
+	}
+	return nil
 }
 
 func (c *LinearClient) linearBlockersFromInverseRelations(ctx context.Context, issueID string, nodes []linearRelationNode, hasNextPage bool, endCursor string) ([]BlockerRef, error) { //nolint:gocognit // baseline (#521)
