@@ -593,8 +593,8 @@ func TestListIssuesByStatesPaginates(t *testing.T) {
 		}
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		if op == "ListIssueInverseRelations" {
-			_, _ = io.WriteString(w, `{"data":{"issue":{"inverseRelations":{"nodes":[{"type":"blocks","issue":{"id":"blocker-1","identifier":"LIN-0","state":{"name":"In Progress"}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`)
+		if op == "ListIssuesInverseRelations" {
+			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[{"id":"issue-1","inverseRelations":{"nodes":[{"type":"blocks","issue":{"id":"blocker-1","identifier":"LIN-0","state":{"name":"In Progress"}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}]}}}`)
 			return
 		}
 		if idx >= len(pages) {
@@ -630,8 +630,8 @@ func TestListIssuesByStatesPaginates(t *testing.T) {
 	if requests[0].Variables["after"] != nil {
 		t.Fatalf("first request after = %v, want nil", requests[0].Variables["after"])
 	}
-	if requests[1].Variables["id"] != "issue-1" {
-		t.Fatalf("blocker request id = %v, want issue-1", requests[1].Variables["id"])
+	if ids, ok := requests[1].Variables["ids"].([]any); !ok || len(ids) != 1 || ids[0] != "issue-1" {
+		t.Fatalf("blocker request ids = %v, want [issue-1]", requests[1].Variables["ids"])
 	}
 	if requests[2].Variables["after"] != "cursor-1" {
 		t.Fatalf("second ListIssues request after = %v, want cursor-1", requests[2].Variables["after"])
@@ -646,7 +646,7 @@ func TestListIssuesByStatesPaginates(t *testing.T) {
 		t.Fatalf("ListIssues query should not fetch relation metadata for every candidate: %s", requests[0].Query)
 	}
 	if !strings.Contains(requests[1].Query, "inverseRelations") || !strings.Contains(requests[1].Query, "issue { id identifier state") {
-		t.Fatalf("ListIssueInverseRelations query = %s, want inverse relation blocker issue fields", requests[1].Query)
+		t.Fatalf("ListIssuesInverseRelations query = %s, want inverse relation blocker issue fields", requests[1].Query)
 	}
 }
 
@@ -670,7 +670,9 @@ func TestListIssuesByStatesPaginatesLinearInverseRelationsBeforeMappingBlockers(
 		case 1:
 			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[{"id":"issue-1","identifier":"LIN-1","title":"One","description":"","url":"https://linear.app/acme/issue/LIN-1","priority":1,"createdAt":"2026-05-15T00:00:00Z","updatedAt":"2026-05-16T00:00:00Z","state":{"name":"Todo"}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}`)
 		case 2:
-			_, _ = io.WriteString(w, `{"data":{"issue":{"inverseRelations":{"nodes":[{"type":"blocks","issue":{"id":"blocker-1","identifier":"LIN-0","state":{"name":"Done"}}}],"pageInfo":{"hasNextPage":true,"endCursor":"relation-cursor"}}}}}`)
+			// Batched first page (one request for all Todo ids): blocker-1 with a
+			// next page so the per-issue overflow query (case 3) must still run.
+			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[{"id":"issue-1","inverseRelations":{"nodes":[{"type":"blocks","issue":{"id":"blocker-1","identifier":"LIN-0","state":{"name":"Done"}}}],"pageInfo":{"hasNextPage":true,"endCursor":"relation-cursor"}}}]}}}`)
 		case 3:
 			_, _ = io.WriteString(w, `{"data":{"issue":{"inverseRelations":{"nodes":[{"type":"blocks","issue":{"id":"blocker-2","identifier":"LIN-2","state":{"name":"In Progress"}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}}`)
 		default:
@@ -693,11 +695,146 @@ func TestListIssuesByStatesPaginatesLinearInverseRelationsBeforeMappingBlockers(
 	if got := len(requests); got != 3 {
 		t.Fatalf("requests = %d, want candidate page plus inverse relation pages", got)
 	}
-	if requests[1].Variables["id"] != "issue-1" || requests[1].Variables["after"] != nil {
-		t.Fatalf("first relation request variables = %#v, want issue id and nil cursor", requests[1].Variables)
+	if ids, ok := requests[1].Variables["ids"].([]any); !ok || len(ids) != 1 || ids[0] != "issue-1" {
+		t.Fatalf("first relation request ids = %#v, want batched [issue-1]", requests[1].Variables["ids"])
 	}
 	if requests[2].Variables["id"] != "issue-1" || requests[2].Variables["after"] != "relation-cursor" {
-		t.Fatalf("second relation request variables = %#v, want issue id and relation cursor", requests[2].Variables)
+		t.Fatalf("overflow relation request variables = %#v, want issue id and relation cursor", requests[2].Variables)
+	}
+}
+
+// TestListIssuesByStatesBatchesBlockerLookupsForManyTodoIssues pins #672: three
+// Todo issues on one page resolve their blockers in a single batched query
+// (2 requests total) rather than one query per issue (the prior N+1 = 4
+// requests), while every issue still receives its own correct blockers.
+func TestListIssuesByStatesBatchesBlockerLookupsForManyTodoIssues(t *testing.T) {
+	var mu sync.Mutex
+	var requests []fakeLinearRequest
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.Unmarshal(body, &payload)
+		op := opNameFromQuery(payload.Query)
+		mu.Lock()
+		requests = append(requests, fakeLinearRequest{OpName: op, Query: payload.Query, Variables: payload.Variables})
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch op {
+		case "ListIssues":
+			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[`+
+				`{"id":"issue-1","identifier":"LIN-1","title":"One","description":"","url":"u1","priority":1,"createdAt":"2026-05-15T00:00:00Z","updatedAt":"2026-05-16T00:00:00Z","state":{"name":"Todo"}},`+
+				`{"id":"issue-2","identifier":"LIN-2","title":"Two","description":"","url":"u2","priority":1,"createdAt":"2026-05-15T00:00:00Z","updatedAt":"2026-05-16T00:00:00Z","state":{"name":"Todo"}},`+
+				`{"id":"issue-3","identifier":"LIN-3","title":"Three","description":"","url":"u3","priority":1,"createdAt":"2026-05-15T00:00:00Z","updatedAt":"2026-05-16T00:00:00Z","state":{"name":"Todo"}}`+
+				`],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}`)
+		case "ListIssuesInverseRelations":
+			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[`+
+				`{"id":"issue-1","inverseRelations":{"nodes":[{"type":"blocks","issue":{"id":"b1","identifier":"LIN-91","state":{"name":"In Progress"}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}},`+
+				`{"id":"issue-2","inverseRelations":{"nodes":[{"type":"blocks","issue":{"id":"b2","identifier":"LIN-92","state":{"name":"Done"}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}},`+
+				`{"id":"issue-3","inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}`+
+				`]}}}`)
+		default:
+			t.Fatalf("unexpected op %q", op)
+		}
+	}))
+	defer httpSrv.Close()
+	client := newTestClient(t, httpSrv, workflow.TrackerConfig{ProjectSlug: "aiops"})
+
+	issues, err := client.ListIssuesByStates(context.Background(), []string{"Todo"})
+	if err != nil {
+		t.Fatalf("ListIssuesByStates: %v", err)
+	}
+	if got, want := len(requests), 2; got != want {
+		t.Fatalf("requests = %d, want %d (one candidate page + one batched blocker query, not N+1)", got, want)
+	}
+	if requests[1].OpName != "ListIssuesInverseRelations" {
+		t.Fatalf("second op = %q, want ListIssuesInverseRelations", requests[1].OpName)
+	}
+	ids, ok := requests[1].Variables["ids"].([]any)
+	if !ok || len(ids) != 3 || ids[0] != "issue-1" || ids[1] != "issue-2" || ids[2] != "issue-3" {
+		t.Fatalf("batched blocker ids = %#v, want [issue-1 issue-2 issue-3]", requests[1].Variables["ids"])
+	}
+	if got := len(issues[0].BlockedBy); got != 1 || issues[0].BlockedBy[0].Identifier != "LIN-91" {
+		t.Fatalf("issue-1 blockers = %#v, want one LIN-91", issues[0].BlockedBy)
+	}
+	if got := len(issues[1].BlockedBy); got != 1 || issues[1].BlockedBy[0].Identifier != "LIN-92" {
+		t.Fatalf("issue-2 blockers = %#v, want one LIN-92", issues[1].BlockedBy)
+	}
+	if got := len(issues[2].BlockedBy); got != 0 {
+		t.Fatalf("issue-3 blockers = %d, want 0", got)
+	}
+}
+
+// TestListIssuesByStatesChunksBlockerBatchAcrossPageSize pins the #672 chunk
+// loop: when a page carries more Todo issues than linearIssuePageSize, the
+// blocker batch is split into linearIssuePageSize-sized ListIssuesInverseRelations
+// requests (mirroring FetchIssueStatesByIDs), and an issue in the trailing chunk
+// still receives its blocker.
+func TestListIssuesByStatesChunksBlockerBatchAcrossPageSize(t *testing.T) {
+	const todoCount = 55 // > linearIssuePageSize (50): forces a second chunk
+	var mu sync.Mutex
+	var batchChunkSizes []int
+	httpSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.Unmarshal(body, &payload)
+		w.Header().Set("Content-Type", "application/json")
+		switch opNameFromQuery(payload.Query) {
+		case "ListIssues":
+			var b strings.Builder
+			b.WriteString(`{"data":{"issues":{"nodes":[`)
+			for i := 1; i <= todoCount; i++ {
+				if i > 1 {
+					b.WriteString(",")
+				}
+				fmt.Fprintf(&b, `{"id":"issue-%d","identifier":"LIN-%d","title":"T","description":"","url":"u","priority":1,"createdAt":"2026-05-15T00:00:00Z","updatedAt":"2026-05-16T00:00:00Z","state":{"name":"Todo"}}`, i, i)
+			}
+			b.WriteString(`],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}`)
+			_, _ = io.WriteString(w, b.String())
+		case "ListIssuesInverseRelations":
+			ids, _ := payload.Variables["ids"].([]any)
+			mu.Lock()
+			batchChunkSizes = append(batchChunkSizes, len(ids))
+			mu.Unlock()
+			var b strings.Builder
+			b.WriteString(`{"data":{"issues":{"nodes":[`)
+			for i, raw := range ids {
+				id, _ := raw.(string)
+				if i > 0 {
+					b.WriteString(",")
+				}
+				fmt.Fprintf(&b, `{"id":%q,"inverseRelations":{"nodes":[{"type":"blocks","issue":{"id":"b-%s","identifier":"BLK-%s","state":{"name":"In Progress"}}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}`, id, id, id)
+			}
+			b.WriteString(`]}}}`)
+			_, _ = io.WriteString(w, b.String())
+		default:
+			t.Fatalf("unexpected op %q", opNameFromQuery(payload.Query))
+		}
+	}))
+	defer httpSrv.Close()
+	client := newTestClient(t, httpSrv, workflow.TrackerConfig{ProjectSlug: "aiops"})
+
+	issues, err := client.ListIssuesByStates(context.Background(), []string{"Todo"})
+	if err != nil {
+		t.Fatalf("ListIssuesByStates: %v", err)
+	}
+	if got, want := len(issues), todoCount; got != want {
+		t.Fatalf("issues = %d, want %d", got, want)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	wantChunks := []int{linearIssuePageSize, todoCount - linearIssuePageSize}
+	if len(batchChunkSizes) != len(wantChunks) || batchChunkSizes[0] != wantChunks[0] || batchChunkSizes[1] != wantChunks[1] {
+		t.Fatalf("blocker batch chunk sizes = %v, want %v (one query per linearIssuePageSize chunk)", batchChunkSizes, wantChunks)
+	}
+	// An issue in the trailing chunk (issue-55) must still receive its blocker.
+	if got := issues[todoCount-1]; len(got.BlockedBy) != 1 || got.BlockedBy[0].Identifier != "BLK-issue-55" {
+		t.Fatalf("issues[%d].BlockedBy = %#v, want one BLK-issue-55", todoCount-1, got.BlockedBy)
 	}
 }
 
@@ -737,11 +874,16 @@ func TestListIssuesByStatesErrorsWhenInverseRelationMaxPagesExceeded(t *testing.
 		}
 		_ = json.Unmarshal(body, &payload)
 		w.Header().Set("Content-Type", "application/json")
-		if opNameFromQuery(payload.Query) == "ListIssues" {
+		switch opNameFromQuery(payload.Query) {
+		case "ListIssues":
 			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[{"id":"issue-1","identifier":"LIN-1","title":"One","description":"","url":"https://linear.app/acme/issue/LIN-1","priority":1,"createdAt":"2026-05-15T00:00:00Z","updatedAt":"2026-05-16T00:00:00Z","state":{"name":"Todo"}}],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}`)
-			return
+		case "ListIssuesInverseRelations":
+			// Batched first page reports a next page, forcing per-issue overflow.
+			_, _ = io.WriteString(w, `{"data":{"issues":{"nodes":[{"id":"issue-1","inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"same-relation-cursor"}}}]}}}`)
+		default:
+			// Per-issue overflow query keeps reporting the same cursor until the cap.
+			_, _ = io.WriteString(w, `{"data":{"issue":{"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"same-relation-cursor"}}}}}`)
 		}
-		_, _ = io.WriteString(w, `{"data":{"issue":{"inverseRelations":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"same-relation-cursor"}}}}}`)
 	}))
 	defer httpSrv.Close()
 	client := newTestClient(t, httpSrv, workflow.TrackerConfig{ProjectSlug: "aiops"})
@@ -869,7 +1011,7 @@ func TestListIssuesByStatesEmptyShortCircuitsWithoutAPICall(t *testing.T) {
 // TestListIssuesByStatesSkipsBlockerFetchForNonTodoIssue pins the isTodoState
 // gate (#521 decomposition characterization): blockers are fetched ONLY for
 // Todo-state issues, so a non-Todo issue must end with empty BlockedBy AND must
-// not trigger a ListIssueInverseRelations request. The existing pagination test
+// not trigger a ListIssuesInverseRelations request. The existing pagination test
 // only asserts the positive (Todo) branch; flipping the gate would survive it.
 func TestListIssuesByStatesSkipsBlockerFetchForNonTodoIssue(t *testing.T) {
 	var mu sync.Mutex
@@ -905,8 +1047,10 @@ func TestListIssuesByStatesSkipsBlockerFetchForNonTodoIssue(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	for _, op := range ops {
-		if op == "ListIssueInverseRelations" {
-			t.Fatalf("server ops = %v, want no ListIssueInverseRelations (blockers fetched only for Todo state)", ops)
+		// Post-#672 a flipped gate fetches blockers via the batched op
+		// ListIssuesInverseRelations (plural); a non-Todo issue must emit none.
+		if op == "ListIssuesInverseRelations" {
+			t.Fatalf("server ops = %v, want no ListIssuesInverseRelations (blockers fetched only for Todo state)", ops)
 		}
 	}
 	if got, want := len(ops), 1; got != want {
