@@ -217,9 +217,13 @@ describe('Worker status dashboard', () => {
     // v1 scattered the buckets: Retrying + Blocked sat in a full-width .grid-2
     // row at the very bottom, below the reference gauges. v2 groups all three
     // in-flight buckets in the main column, directly under the matching KPIs.
-    const mainTitles = [...container.querySelectorAll('.body-main .panel-title')].map((el) => el.textContent);
-    expect(mainTitles).toEqual(['Running2', 'Retrying1', 'Blocked1']); // count badge renders inline
-    const sideTitles = [...container.querySelectorAll('.body-side .panel-title')].map((el) => el.textContent);
+    // Read only the title's own text nodes so the structural assertion is not
+    // coupled to the fixture's count-badge values.
+    const titleText = (el) => [...el.childNodes]
+      .filter((n) => n.nodeType === Node.TEXT_NODE).map((n) => n.textContent).join('');
+    const mainTitles = [...container.querySelectorAll('.body-main .panel-title')].map(titleText);
+    expect(mainTitles).toEqual(['Running', 'Retrying', 'Blocked']);
+    const sideTitles = [...container.querySelectorAll('.body-side .panel-title')].map(titleText);
     expect(sideTitles).toEqual(['Rate limits', 'Reconcile roll-up']);
     expect(container.querySelector('.grid-2')).toBeNull(); // the bottom row is gone
 
